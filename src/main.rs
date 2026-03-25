@@ -78,25 +78,55 @@ fn run_tunnel(args: &Args, running: &AtomicBool) -> Result<(), String> {
     ).map_err(|e| format!("connect: {}", e))?;
     tcp.set_nodelay(true).ok();
 
-    // TODO: TLS mode needs shared stream approach (future)
     if args.tls {
-        eprintln!("[tunnel] TLS mode not yet supported for bidirectional, using plain TCP");
+        let tls_config = build_tls_config(args.insecure, &args.cert, &args.key);
+        let server_name = args.server.split(':').next().unwrap_or("localhost").to_string();
+        let sni = rustls::pki_types::ServerName::try_from(server_name)
+            .map_err(|e| format!("invalid SNI: {}", e))?;
+        let tls_conn = rustls::ClientConnection::new(tls_config, sni)
+            .map_err(|e| format!("tls: {}", e))?;
+        let mut tls_stream = rustls::StreamOwned::new(tls_conn, tcp);
+
+        // TLS handshake + AUTH over blocking TLS
+        do_auth(&mut tls_stream, args)?;
+
+        let has_cert = args.cert.is_some();
+        eprintln!("[tunnel] connected (TLS{})! forwarding to {}",
+            if has_cert { "+mTLS" } else { "" }, args.target);
+
+        // For TLS we use single-thread read+write with timeout
+        run_tunnel_tls_loop(&mut tls_stream, args, running)
+    } else {
+        run_tunnel_on_stream(tcp, args, running)
     }
-    run_tunnel_on_stream(tcp, args, running)
 }
 
-fn build_tls_config(insecure: bool) -> Arc<rustls::ClientConfig> {
+fn build_tls_config(insecure: bool, cert: &Option<String>, key: &Option<String>) -> Arc<rustls::ClientConfig> {
     let _ = rustls::crypto::ring::default_provider().install_default();
+
     let builder = rustls::ClientConfig::builder();
-    let config = if insecure {
+
+    let with_verifier = if insecure {
         builder.dangerous()
             .with_custom_certificate_verifier(Arc::new(InsecureVerifier))
-            .with_no_client_auth()
     } else {
         let mut root_store = rustls::RootCertStore::empty();
         root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-        builder.with_root_certificates(root_store).with_no_client_auth()
+        builder.with_root_certificates(root_store)
     };
+
+    let config = if let (Some(cert_path), Some(key_path)) = (cert, key) {
+        let cert_file = std::fs::File::open(cert_path).expect("open client cert");
+        let key_file = std::fs::File::open(key_path).expect("open client key");
+        let certs: Vec<_> = rustls_pemfile::certs(&mut std::io::BufReader::new(cert_file))
+            .collect::<Result<Vec<_>, _>>().expect("parse client certs");
+        let key = rustls_pemfile::private_key(&mut std::io::BufReader::new(key_file))
+            .expect("parse client key").expect("no key found");
+        with_verifier.with_client_auth_cert(certs, key).expect("client auth cert")
+    } else {
+        with_verifier.with_no_client_auth()
+    };
+
     Arc::new(config)
 }
 
@@ -122,28 +152,73 @@ fn extract_host(s: &str) -> &str {
     s.split(':').next().unwrap_or(s)
 }
 
-fn run_tunnel_on_stream(mut stream: TcpStream, args: &Args, running: &AtomicBool) -> Result<(), String> {
-    // AUTH
+fn do_auth<S: Read + Write>(stream: &mut S, args: &Args) -> Result<(), String> {
     let mut auth_payload = args.name.as_bytes().to_vec();
     auth_payload.push(0);
     auth_payload.extend_from_slice(args.token.as_bytes());
-    let auth_frame = encode_frame(FRAME_AUTH, 0, &auth_payload);
-    stream.write_all(&auth_frame).map_err(|e| format!("auth write: {}", e))?;
+    stream.write_all(&encode_frame(FRAME_AUTH, 0, &auth_payload))
+        .map_err(|e| format!("auth write: {}", e))?;
 
     let mut resp_buf = vec![0u8; 256];
     let n = stream.read(&mut resp_buf).map_err(|e| format!("auth read: {}", e))?;
     if n == 0 { return Err("connection closed during auth".into()); }
 
     match decode_frame(&resp_buf[..n]) {
-        Some((FRAME_AUTH_OK, _, _, _)) => {}
+        Some((FRAME_AUTH_OK, _, _, _)) => Ok(()),
         Some((FRAME_AUTH_ERR, _, _, payload)) => {
-            return Err(format!("auth rejected: {}", String::from_utf8_lossy(payload)));
+            Err(format!("auth rejected: {}", String::from_utf8_lossy(payload)))
         }
-        _ => return Err("unexpected auth response".into()),
+        _ => Err("unexpected auth response".into()),
     }
+}
 
-    let proto = if args.tls { "TLS" } else { "TCP" };
-    eprintln!("[tunnel] connected ({})! forwarding to {}", proto, args.target);
+fn run_tunnel_tls_loop<S: Read + Write>(
+    stream: &mut S,
+    args: &Args,
+    running: &AtomicBool,
+) -> Result<(), String> {
+    let closed = Arc::new(AtomicBool::new(false));
+    let streams_map: Arc<Mutex<HashMap<u32, StreamState>>> = Arc::new(Mutex::new(HashMap::new()));
+    let write_queue: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
+
+    let mut buffer = Vec::with_capacity(READ_BUF_SIZE);
+    let mut read_buf = [0u8; READ_BUF_SIZE];
+
+    while !closed.load(Ordering::Relaxed) && running.load(Ordering::Relaxed) {
+        let frames: Vec<Vec<u8>> = {
+            match write_queue.lock() {
+                Ok(mut q) if !q.is_empty() => std::mem::take(&mut *q),
+                _ => Vec::new(),
+            }
+        };
+        for frame in frames {
+            if stream.write_all(&frame).is_err() { return Ok(()); }
+        }
+
+        match stream.read(&mut read_buf) {
+            Ok(0) => break,
+            Ok(n) => buffer.extend_from_slice(&read_buf[..n]),
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock
+                || e.kind() == std::io::ErrorKind::TimedOut => { continue; }
+            Err(_) => break,
+        }
+
+        loop {
+            match decode_frame(&buffer) {
+                Some((ft, sid, consumed, payload)) => {
+                    handle_frame(ft, sid, payload, args, &streams_map, &write_queue, &closed);
+                    buffer.drain(..consumed);
+                }
+                None => break,
+            }
+        }
+    }
+    Ok(())
+}
+
+fn run_tunnel_on_stream(mut stream: TcpStream, args: &Args, running: &AtomicBool) -> Result<(), String> {
+    do_auth(&mut stream, args)?;
+    eprintln!("[tunnel] connected (TCP)! forwarding to {}", args.target);
 
     let closed = Arc::new(AtomicBool::new(false));
     let streams_map: Arc<Mutex<HashMap<u32, StreamState>>> = Arc::new(Mutex::new(HashMap::new()));
@@ -382,6 +457,8 @@ struct Args {
     target: String,
     tls: bool,
     insecure: bool,
+    cert: Option<String>,
+    key: Option<String>,
 }
 
 fn parse_args() -> Args {
@@ -392,6 +469,8 @@ fn parse_args() -> Args {
     let mut target = String::new();
     let mut tls = false;
     let mut insecure = false;
+    let mut cert: Option<String> = None;
+    let mut key: Option<String> = None;
 
     let mut i = 1;
     while i < args.len() {
@@ -400,16 +479,20 @@ fn parse_args() -> Args {
             "--name" | "-n" => { i += 1; if i < args.len() { name = args[i].clone(); } }
             "--token" | "-t" => { i += 1; if i < args.len() { token = args[i].clone(); } }
             "--target" | "-T" => { i += 1; if i < args.len() { target = args[i].clone(); } }
+            "--cert" => { i += 1; if i < args.len() { cert = Some(args[i].clone()); tls = true; } }
+            "--key" => { i += 1; if i < args.len() { key = Some(args[i].clone()); } }
             "--tls" => { tls = true; }
             "--insecure" | "-k" => { insecure = true; tls = true; }
             "--help" | "-h" => {
-                eprintln!("Usage: tunnel-client [OPTIONS]");
+                eprintln!("Usage: gateway-tunnel [OPTIONS]");
                 eprintln!("  -s, --server HOST:PORT  Tunnel server address");
                 eprintln!("  -n, --name   NAME       Tunnel name");
                 eprintln!("  -t, --token  TOKEN      Auth token");
                 eprintln!("  -T, --target HOST:PORT  Local service (default: 127.0.0.1:3000)");
                 eprintln!("  --tls                   Enable TLS");
-                eprintln!("  --insecure, -k          Skip TLS cert verification");
+                eprintln!("  --cert FILE             Client certificate (enables mTLS)");
+                eprintln!("  --key FILE              Client private key");
+                eprintln!("  --insecure, -k          Skip server cert verification");
                 std::process::exit(0);
             }
             _ => { if server.is_empty() { server = args[i].clone(); } }
@@ -422,13 +505,15 @@ fn parse_args() -> Args {
     if token.is_empty() { token = std::env::var("TUNNEL_TOKEN").unwrap_or_default(); }
     if target.is_empty() { target = std::env::var("TUNNEL_TARGET").unwrap_or_else(|_| "127.0.0.1:3000".into()); }
     if !tls && std::env::var("TUNNEL_TLS").map(|v| v == "true" || v == "1").unwrap_or(false) { tls = true; }
+    if cert.is_none() { cert = std::env::var("TUNNEL_CERT").ok(); if cert.is_some() { tls = true; } }
+    if key.is_none() { key = std::env::var("TUNNEL_KEY").ok(); }
 
     if server.is_empty() || name.is_empty() {
         eprintln!("Error: --server and --name required");
         std::process::exit(1);
     }
 
-    Args { server, name, token, target, tls, insecure }
+    Args { server, name, token, target, tls, insecure, cert, key }
 }
 
 #[cfg(test)]
