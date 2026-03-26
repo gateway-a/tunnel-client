@@ -179,14 +179,14 @@ fn run_tunnel_tls_loop<S: Read + Write>(
 ) -> Result<(), String> {
     let closed = Arc::new(AtomicBool::new(false));
     let streams_map: Arc<Mutex<HashMap<u32, StreamState>>> = Arc::new(Mutex::new(HashMap::new()));
-    let write_queue: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
+    let write_queue: Arc<(Mutex<Vec<Vec<u8>>>, std::sync::Condvar)> = Arc::new((Mutex::new(Vec::new()), std::sync::Condvar::new()));
 
     let mut buffer = Vec::with_capacity(READ_BUF_SIZE);
     let mut read_buf = [0u8; READ_BUF_SIZE];
 
     while !closed.load(Ordering::Relaxed) && running.load(Ordering::Relaxed) {
         let frames: Vec<Vec<u8>> = {
-            match write_queue.lock() {
+            match write_queue.0.lock() {
                 Ok(mut q) if !q.is_empty() => std::mem::take(&mut *q),
                 _ => Vec::new(),
             }
@@ -222,14 +222,15 @@ fn run_tunnel_on_stream(mut stream: TcpStream, args: &Args, running: &AtomicBool
 
     let closed = Arc::new(AtomicBool::new(false));
     let streams_map: Arc<Mutex<HashMap<u32, StreamState>>> = Arc::new(Mutex::new(HashMap::new()));
-    let write_queue: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
+    let write_queue: Arc<(Mutex<Vec<Vec<u8>>>, std::sync::Condvar)> =
+        Arc::new((Mutex::new(Vec::new()), std::sync::Condvar::new()));
 
     // Writer thread: drains write_queue → tunnel stream
     let writer_stream = stream.try_clone().map_err(|e| format!("clone: {}", e))?;
     let wq_writer = Arc::clone(&write_queue);
     let closed_writer = Arc::clone(&closed);
     let writer = std::thread::spawn(move || {
-        tunnel_writer_thread(writer_stream, wq_writer, closed_writer);
+        tunnel_writer_condvar(writer_stream, wq_writer, closed_writer);
     });
 
     // Reader: main thread reads from tunnel stream
@@ -241,11 +242,11 @@ fn run_tunnel_on_stream(mut stream: TcpStream, args: &Args, running: &AtomicBool
 
     while !closed.load(Ordering::Relaxed) && running.load(Ordering::Relaxed) {
         match stream.read(&mut read_buf) {
-            Ok(0) => break,
-            Ok(n) => buffer.extend_from_slice(&read_buf[..n]),
+            Ok(0) => { eprintln!("[client] tunnel EOF"); break; }
+            Ok(n) => { eprintln!("[client] tunnel read {} bytes", n); buffer.extend_from_slice(&read_buf[..n]); }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock
                 || e.kind() == std::io::ErrorKind::TimedOut => { continue; }
-            Err(_) => break,
+            Err(e) => { eprintln!("[client] tunnel read error: {}", e); break; }
         }
 
         loop {
@@ -270,42 +271,51 @@ fn handle_frame(
     payload: &[u8],
     args: &Args,
     streams_map: &Arc<Mutex<HashMap<u32, StreamState>>>,
-    write_queue: &Arc<Mutex<Vec<Vec<u8>>>>,
+    write_queue: &Arc<(Mutex<Vec<Vec<u8>>>, std::sync::Condvar)>,
     closed: &Arc<AtomicBool>,
 ) {
     match frame_type {
         FRAME_OPEN => {
-            let backend = TcpStream::connect_timeout(
+            let (bw, br) = match TcpStream::connect_timeout(
                 &args.target.parse().unwrap_or_else(|_| "127.0.0.1:3000".parse().unwrap()),
                 Duration::from_secs(5),
-            ).ok().map(|s| {
-                s.set_nodelay(true).ok();
-                Arc::new(Mutex::new(s))
-            });
+            ) {
+                Ok(s) => {
+                    s.set_nodelay(true).ok();
+                    let r = s.try_clone().ok();
+                    (Some(s), r)
+                }
+                Err(_) => (None, None),
+            };
             let mut s = streams_map.lock().unwrap();
-            s.insert(stream_id, StreamState { backend, reader_started: false });
+            s.insert(stream_id, StreamState { backend_writer: bw, backend_reader: br });
         }
         FRAME_DATA => {
-            let mut s = streams_map.lock().unwrap();
-            if let Some(state) = s.get_mut(&stream_id) {
-                if let Some(ref backend) = state.backend {
-                    if let Ok(mut b) = backend.lock() {
-                        let _ = b.write_all(payload);
+            let start_reader = {
+                let mut s = streams_map.lock().unwrap();
+                if let Some(state) = s.get_mut(&stream_id) {
+                    if let Some(ref mut bw) = state.backend_writer {
+                        let _ = bw.write_all(payload);
                     }
-                    if !state.reader_started {
-                        state.reader_started = true;
-                        let backend = Arc::clone(backend);
-                        let wq = Arc::clone(write_queue);
-                        let cl = Arc::clone(closed);
-                        std::thread::spawn(move || {
-                            backend_reader(stream_id, backend, wq, cl);
-                        });
-                    }
-                } else {
-                    let resp = b"HTTP/1.1 502 Bad Gateway\r\ncontent-length: 0\r\n\r\n";
-                    if let Ok(mut q) = write_queue.lock() {
-                        q.push(encode_frame(FRAME_DATA, stream_id, resp));
-                        q.push(encode_frame(FRAME_CLOSE, stream_id, &[]));
+                    // Take reader fd to spawn thread (only once)
+                    state.backend_reader.take()
+                } else { None }
+            };
+            if let Some(reader_stream) = start_reader {
+                let wq = Arc::clone(write_queue);
+                let cl = Arc::clone(closed);
+                std::thread::spawn(move || {
+                    backend_reader_simple(stream_id, reader_stream, wq, cl);
+                });
+            } else {
+                let s = streams_map.lock().unwrap();
+                if let Some(state) = s.get(&stream_id) {
+                    if state.backend_writer.is_none() {
+                        let resp = b"HTTP/1.1 502 Bad Gateway\r\ncontent-length: 0\r\n\r\n";
+                        if let Ok(mut q) = write_queue.0.lock() {
+                            q.push(encode_frame(FRAME_DATA, stream_id, resp));
+                            q.push(encode_frame(FRAME_CLOSE, stream_id, &[]));
+                        }
                     }
                 }
             }
@@ -313,116 +323,82 @@ fn handle_frame(
         FRAME_CLOSE => {
             let mut s = streams_map.lock().unwrap();
             if let Some(state) = s.remove(&stream_id) {
-                if let Some(ref backend) = state.backend {
-                    if let Ok(b) = backend.lock() {
-                        let _ = b.shutdown(std::net::Shutdown::Write);
-                    }
+                if let Some(bw) = state.backend_writer {
+                    let _ = bw.shutdown(std::net::Shutdown::Both);
                 }
             }
         }
         FRAME_PING => {
-            if let Ok(mut q) = write_queue.lock() {
+            if let Ok(mut q) = write_queue.0.lock() {
                 q.push(encode_frame(FRAME_PONG, 0, &[]));
             }
+            write_queue.1.notify_one();
         }
         _ => {}
     }
 }
 
-fn tunnel_writer_thread<W: Write>(mut writer: W, queue: Arc<Mutex<Vec<Vec<u8>>>>, closed: Arc<AtomicBool>) {
-    while !closed.load(Ordering::Relaxed) {
+fn tunnel_writer_condvar<W: Write>(mut writer: W, queue: Arc<(Mutex<Vec<Vec<u8>>>, std::sync::Condvar)>, closed: Arc<AtomicBool>) {
+    eprintln!("[client-writer] started");
+    loop {
+        if closed.load(Ordering::Relaxed) { break; }
         let frames: Vec<Vec<u8>> = {
-            match queue.lock() {
-                Ok(mut q) if !q.is_empty() => std::mem::take(&mut *q),
-                _ => {
-                    std::thread::sleep(Duration::from_micros(100));
-                    continue;
-                }
+            let mut q = queue.0.lock().unwrap();
+            if q.is_empty() {
+                let (q2, _) = queue.1.wait_timeout(q, Duration::from_millis(5)).unwrap();
+                q = q2;
             }
+            if q.is_empty() { continue; }
+            std::mem::take(&mut *q)
         };
-        for frame in frames {
-            if writer.write_all(&frame).is_err() {
-                closed.store(true, Ordering::Release);
-                return;
-            }
+        let mut batch = Vec::with_capacity(frames.iter().map(|f| f.len()).sum());
+        for f in frames { batch.extend_from_slice(&f); }
+        eprintln!("[client-writer] flushing {} bytes", batch.len());
+        if writer.write_all(&batch).is_err() {
+            eprintln!("[client-writer] write error!");
+            closed.store(true, Ordering::Release);
+            return;
         }
     }
+    eprintln!("[client-writer] exited");
 }
 
 struct StreamState {
-    backend: Option<Arc<Mutex<TcpStream>>>,
-    reader_started: bool,
+    backend_writer: Option<TcpStream>,
+    backend_reader: Option<TcpStream>,
 }
 
-fn backend_reader(
+fn backend_reader_simple(
     stream_id: u32,
-    backend: Arc<Mutex<TcpStream>>,
-    write_queue: Arc<Mutex<Vec<Vec<u8>>>>,
+    mut backend: TcpStream,
+    write_queue: Arc<(Mutex<Vec<Vec<u8>>>, std::sync::Condvar)>,
     closed: Arc<AtomicBool>,
 ) {
     let mut buf = [0u8; 32768];
+    backend.set_read_timeout(Some(Duration::from_secs(30))).ok();
+    eprintln!("[backend-reader] started for stream_id={}", stream_id);
 
-    // First read: blocking with timeout (wait for response)
-    {
-        let mut b = match backend.lock() {
-            Ok(b) => b,
-            Err(_) => return,
-        };
-        let _ = b.set_nonblocking(false);
-        let _ = b.set_read_timeout(Some(Duration::from_secs(30)));
-        match b.read(&mut buf) {
-            Ok(0) => {
-                if let Ok(mut q) = write_queue.lock() {
-                    q.push(encode_frame(FRAME_CLOSE, stream_id, &[]));
-                }
-                return;
-            }
-            Ok(n) => {
-                if let Ok(mut q) = write_queue.lock() {
-                    q.push(encode_frame(FRAME_DATA, stream_id, &buf[..n]));
-                }
-            }
-            Err(_) => {
-                if let Ok(mut q) = write_queue.lock() {
-                    q.push(encode_frame(FRAME_CLOSE, stream_id, &[]));
-                }
-                return;
-            }
-        }
-        let _ = b.set_nonblocking(true);
-    }
-
-    // Subsequent reads: non-blocking (drain remaining data)
     loop {
         if closed.load(Ordering::Relaxed) { break; }
-        let n = {
-            let mut b = match backend.lock() {
-                Ok(b) => b,
-                Err(_) => break,
-            };
-            match b.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => n,
-                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    drop(b);
-                    std::thread::sleep(Duration::from_micros(200));
-                    continue;
+        match backend.read(&mut buf) {
+            Ok(0) => { eprintln!("[backend-reader] EOF stream_id={}", stream_id); break; }
+            Ok(n) => { eprintln!("[backend-reader] got {} bytes for stream_id={}", n, stream_id);
+                if let Ok(mut q) = write_queue.0.lock() {
+                    q.push(encode_frame(FRAME_DATA, stream_id, &buf[..n]));
                 }
-                Err(_) => break,
+                write_queue.1.notify_one();
             }
-        };
-
-        if let Ok(mut q) = write_queue.lock() {
-            q.push(encode_frame(FRAME_DATA, stream_id, &buf[..n]));
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock
+                || e.kind() == std::io::ErrorKind::TimedOut => continue,
+            Err(_) => break,
         }
     }
 
-    if let Ok(mut q) = write_queue.lock() {
+    if let Ok(mut q) = write_queue.0.lock() {
         q.push(encode_frame(FRAME_CLOSE, stream_id, &[]));
     }
+    write_queue.1.notify_one();
 }
-
-
 
 
 // --- Signal handling ---
