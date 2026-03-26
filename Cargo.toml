@@ -9,6 +9,9 @@ path = "src/main.rs"
 
 [dependencies]
 libc = "0.2"
+aes-gcm = "0.10"
+hmac = "0.12"
+sha2 = "0.10"
 rustls = { version = "0.23", features = ["ring"] }
 rustls-pemfile = "2"
 webpki-roots = "0.26"

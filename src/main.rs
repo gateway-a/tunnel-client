@@ -5,6 +5,57 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+// --- Frame encryption ---
+
+use std::sync::atomic::AtomicU64;
+
+struct FrameCrypto {
+    key: aes_gcm::Aes256Gcm,
+    counter: AtomicU64,
+}
+
+impl FrameCrypto {
+    fn from_token(token: &str) -> Self {
+        use hmac::Mac;
+        let mut mac = <hmac::Hmac<sha2::Sha256> as Mac>::new_from_slice(token.as_bytes())
+            .unwrap_or_else(|_| <hmac::Hmac<sha2::Sha256> as Mac>::new_from_slice(b"default").unwrap());
+        mac.update(b"tunnel-frame-encryption-key-v1");
+        let derived = mac.finalize().into_bytes();
+        use aes_gcm::KeyInit;
+        let key = aes_gcm::Aes256Gcm::new(aes_gcm::Key::<aes_gcm::Aes256Gcm>::from_slice(&derived));
+        Self { key, counter: AtomicU64::new(1) }
+    }
+
+    fn encrypt(&self, data: &[u8]) -> Vec<u8> {
+        use aes_gcm::AeadInPlace;
+        let ctr = self.counter.fetch_add(1, Ordering::Relaxed);
+        let mut nonce_bytes = [0u8; 12];
+        nonce_bytes[4..12].copy_from_slice(&ctr.to_be_bytes());
+        let nonce = aes_gcm::Nonce::from(nonce_bytes);
+        let mut buf = data.to_vec();
+        let tag = self.key.encrypt_in_place_detached(&nonce, &[], &mut buf).expect("encrypt");
+        let mut out = Vec::with_capacity(8 + buf.len() + 16);
+        out.extend_from_slice(&ctr.to_be_bytes());
+        out.extend_from_slice(&buf);
+        out.extend_from_slice(&tag);
+        out
+    }
+
+    fn decrypt(&self, data: &[u8]) -> Option<Vec<u8>> {
+        use aes_gcm::AeadInPlace;
+        if data.len() < 24 { return None; }
+        let ctr = u64::from_be_bytes([data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7]]);
+        let tag_start = data.len() - 16;
+        let mut buf = data[8..tag_start].to_vec();
+        let tag = aes_gcm::Tag::from_slice(&data[tag_start..]);
+        let mut nonce_bytes = [0u8; 12];
+        nonce_bytes[4..12].copy_from_slice(&ctr.to_be_bytes());
+        let nonce = aes_gcm::Nonce::from(nonce_bytes);
+        self.key.decrypt_in_place_detached(&nonce, &[], &mut buf, tag).ok()?;
+        Some(buf)
+    }
+}
+
 // --- Frame protocol (same as server) ---
 
 const FRAME_AUTH: u8 = 0x01;
@@ -180,6 +231,9 @@ fn run_tunnel_tls_loop<S: Read + Write>(
     let closed = Arc::new(AtomicBool::new(false));
     let streams_map: Arc<Mutex<HashMap<u32, StreamState>>> = Arc::new(Mutex::new(HashMap::new()));
     let write_queue: Arc<(Mutex<Vec<Vec<u8>>>, std::sync::Condvar)> = Arc::new((Mutex::new(Vec::new()), std::sync::Condvar::new()));
+    let crypto: Option<Arc<FrameCrypto>> = if !args.token.is_empty() {
+        Some(Arc::new(FrameCrypto::from_token(&args.token)))
+    } else { None };
 
     let mut buffer = Vec::with_capacity(READ_BUF_SIZE);
     let mut read_buf = [0u8; READ_BUF_SIZE];
@@ -206,7 +260,7 @@ fn run_tunnel_tls_loop<S: Read + Write>(
         loop {
             match decode_frame(&buffer) {
                 Some((ft, sid, consumed, payload)) => {
-                    handle_frame(ft, sid, payload, args, &streams_map, &write_queue, &closed);
+                    handle_frame(ft, sid, payload, args, &streams_map, &write_queue, &closed, &crypto);
                     buffer.drain(..consumed);
                 }
                 None => break,
@@ -224,6 +278,9 @@ fn run_tunnel_on_stream(mut stream: TcpStream, args: &Args, running: &AtomicBool
     let streams_map: Arc<Mutex<HashMap<u32, StreamState>>> = Arc::new(Mutex::new(HashMap::new()));
     let write_queue: Arc<(Mutex<Vec<Vec<u8>>>, std::sync::Condvar)> =
         Arc::new((Mutex::new(Vec::new()), std::sync::Condvar::new()));
+    let crypto: Option<Arc<FrameCrypto>> = if !args.token.is_empty() {
+        Some(Arc::new(FrameCrypto::from_token(&args.token)))
+    } else { None };
 
     // Writer thread: drains write_queue → tunnel stream
     let writer_stream = stream.try_clone().map_err(|e| format!("clone: {}", e))?;
@@ -252,7 +309,7 @@ fn run_tunnel_on_stream(mut stream: TcpStream, args: &Args, running: &AtomicBool
         loop {
             match decode_frame(&buffer) {
                 Some((frame_type, stream_id, consumed, payload)) => {
-                    handle_frame(frame_type, stream_id, payload, args, &streams_map, &write_queue, &closed);
+                    handle_frame(frame_type, stream_id, payload, args, &streams_map, &write_queue, &closed, &crypto);
                     buffer.drain(..consumed);
                 }
                 None => break,
@@ -273,7 +330,16 @@ fn handle_frame(
     streams_map: &Arc<Mutex<HashMap<u32, StreamState>>>,
     write_queue: &Arc<(Mutex<Vec<Vec<u8>>>, std::sync::Condvar)>,
     closed: &Arc<AtomicBool>,
+    crypto: &Option<Arc<FrameCrypto>>,
 ) {
+    // Decrypt DATA payload if encrypted
+    let decrypted;
+    let payload = if frame_type == FRAME_DATA {
+        if let Some(ref c) = crypto {
+            decrypted = c.decrypt(payload).unwrap_or_default();
+            &decrypted
+        } else { payload }
+    } else { payload };
     match frame_type {
         FRAME_OPEN => {
             let (bw, br) = match TcpStream::connect_timeout(
@@ -304,8 +370,9 @@ fn handle_frame(
             if let Some(reader_stream) = start_reader {
                 let wq = Arc::clone(write_queue);
                 let cl = Arc::clone(closed);
+                let cr = crypto.clone();
                 std::thread::spawn(move || {
-                    backend_reader_simple(stream_id, reader_stream, wq, cl);
+                    backend_reader_simple(stream_id, reader_stream, wq, cl, cr);
                 });
             } else {
                 let s = streams_map.lock().unwrap();
@@ -373,6 +440,7 @@ fn backend_reader_simple(
     mut backend: TcpStream,
     write_queue: Arc<(Mutex<Vec<Vec<u8>>>, std::sync::Condvar)>,
     closed: Arc<AtomicBool>,
+    crypto: Option<Arc<FrameCrypto>>,
 ) {
     let mut buf = [0u8; 32768];
     let mut got_data = false;
@@ -386,8 +454,13 @@ fn backend_reader_simple(
             Ok(0) => break,
             Ok(n) => {
                 got_data = true;
+                let frame_payload = if let Some(ref c) = crypto {
+                    c.encrypt(&buf[..n])
+                } else {
+                    buf[..n].to_vec()
+                };
                 if let Ok(mut q) = write_queue.0.lock() {
-                    q.push(encode_frame(FRAME_DATA, stream_id, &buf[..n]));
+                    q.push(encode_frame(FRAME_DATA, stream_id, &frame_payload));
                 }
                 write_queue.1.notify_one();
                 // After first data, use short timeout for subsequent reads
