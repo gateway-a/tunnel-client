@@ -375,21 +375,30 @@ fn backend_reader_simple(
     closed: Arc<AtomicBool>,
 ) {
     let mut buf = [0u8; 32768];
+    let mut got_data = false;
+
+    // First read: wait up to 30s for response start
     backend.set_read_timeout(Some(Duration::from_secs(30))).ok();
-    eprintln!("[backend-reader] started for stream_id={}", stream_id);
 
     loop {
         if closed.load(Ordering::Relaxed) { break; }
         match backend.read(&mut buf) {
-            Ok(0) => { eprintln!("[backend-reader] EOF stream_id={}", stream_id); break; }
-            Ok(n) => { eprintln!("[backend-reader] got {} bytes for stream_id={}", n, stream_id);
+            Ok(0) => break,
+            Ok(n) => {
+                got_data = true;
                 if let Ok(mut q) = write_queue.0.lock() {
                     q.push(encode_frame(FRAME_DATA, stream_id, &buf[..n]));
                 }
                 write_queue.1.notify_one();
+                // After first data, use short timeout for subsequent reads
+                backend.set_read_timeout(Some(Duration::from_secs(2))).ok();
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock
-                || e.kind() == std::io::ErrorKind::TimedOut => continue,
+                || e.kind() == std::io::ErrorKind::TimedOut => {
+                // If we already got data and timeout → response complete
+                if got_data { break; }
+                continue;
+            }
             Err(_) => break,
         }
     }
