@@ -10,8 +10,7 @@ use std::time::Duration;
 use std::sync::atomic::AtomicU64;
 
 struct FrameCrypto {
-    seal_key: ring::aead::LessSafeKey,
-    open_key: ring::aead::LessSafeKey,
+    key: [u8; 32],
     counter: AtomicU64,
 }
 
@@ -22,39 +21,45 @@ impl FrameCrypto {
             .unwrap_or_else(|_| <hmac::Hmac<sha2::Sha256> as Mac>::new_from_slice(b"default").unwrap());
         mac.update(b"tunnel-frame-encryption-key-v1");
         let derived = mac.finalize().into_bytes();
-
-        let unbound = ring::aead::UnboundKey::new(&ring::aead::AES_256_GCM, &derived).unwrap();
-        let seal_key = ring::aead::LessSafeKey::new(unbound);
-        let unbound2 = ring::aead::UnboundKey::new(&ring::aead::AES_256_GCM, &derived).unwrap();
-        let open_key = ring::aead::LessSafeKey::new(unbound2);
-
-        Self { seal_key, open_key, counter: AtomicU64::new(1) }
+        let mut key = [0u8; 32];
+        key.copy_from_slice(&derived);
+        Self { key, counter: AtomicU64::new(1) }
     }
 
     fn encrypt(&self, data: &[u8]) -> Vec<u8> {
+        use chacha20poly1305::{ChaCha20Poly1305, KeyInit, AeadInPlace};
         let ctr = self.counter.fetch_add(1, Ordering::Relaxed);
         let mut nonce_bytes = [0u8; 12];
         nonce_bytes[4..12].copy_from_slice(&ctr.to_be_bytes());
-        let nonce = ring::aead::Nonce::assume_unique_for_key(nonce_bytes);
+
+        let cipher = ChaCha20Poly1305::new(chacha20poly1305::Key::from_slice(&self.key));
+        let nonce = chacha20poly1305::Nonce::from(nonce_bytes);
 
         let mut buf = data.to_vec();
-        self.seal_key.seal_in_place_append_tag(nonce, ring::aead::Aad::empty(), &mut buf).unwrap();
+        let tag = cipher.encrypt_in_place_detached(&nonce, &[], &mut buf).expect("encrypt");
 
-        let mut out = Vec::with_capacity(8 + buf.len());
+        let mut out = Vec::with_capacity(8 + buf.len() + 16);
         out.extend_from_slice(&ctr.to_be_bytes());
         out.extend_from_slice(&buf);
+        out.extend_from_slice(&tag);
         out
     }
 
     fn decrypt(&self, data: &[u8]) -> Option<Vec<u8>> {
+        use chacha20poly1305::{ChaCha20Poly1305, KeyInit, AeadInPlace};
         if data.len() < 24 { return None; }
         let mut nonce_bytes = [0u8; 12];
         nonce_bytes[4..12].copy_from_slice(&data[..8]);
-        let nonce = ring::aead::Nonce::assume_unique_for_key(nonce_bytes);
 
-        let mut buf = data[8..].to_vec();
-        let plaintext = self.open_key.open_in_place(nonce, ring::aead::Aad::empty(), &mut buf).ok()?;
-        Some(plaintext.to_vec())
+        let cipher = ChaCha20Poly1305::new(chacha20poly1305::Key::from_slice(&self.key));
+        let nonce = chacha20poly1305::Nonce::from(nonce_bytes);
+
+        let tag_start = data.len() - 16;
+        let mut buf = data[8..tag_start].to_vec();
+        let tag = chacha20poly1305::Tag::from_slice(&data[tag_start..]);
+
+        cipher.decrypt_in_place_detached(&nonce, &[], &mut buf, tag).ok()?;
+        Some(buf)
     }
 }
 
@@ -341,7 +346,7 @@ fn handle_frame(
             match c.decrypt(payload) {
                 Some(d) => { decrypted = d; &decrypted }
                 None => {
-                    eprintln!("[client] decrypt FAILED! payload_len={}", payload.len());
+                    eprintln!("[client] decrypt FAILED! payload_len={} first16={:02x?}", payload.len(), &payload[..16.min(payload.len())]);
                     return;
                 }
             }
