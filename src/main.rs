@@ -10,7 +10,8 @@ use std::time::Duration;
 use std::sync::atomic::AtomicU64;
 
 struct FrameCrypto {
-    key: aes_gcm::Aes256Gcm,
+    seal_key: ring::aead::LessSafeKey,
+    open_key: ring::aead::LessSafeKey,
     counter: AtomicU64,
 }
 
@@ -21,38 +22,39 @@ impl FrameCrypto {
             .unwrap_or_else(|_| <hmac::Hmac<sha2::Sha256> as Mac>::new_from_slice(b"default").unwrap());
         mac.update(b"tunnel-frame-encryption-key-v1");
         let derived = mac.finalize().into_bytes();
-        use aes_gcm::KeyInit;
-        let key = aes_gcm::Aes256Gcm::new(aes_gcm::Key::<aes_gcm::Aes256Gcm>::from_slice(&derived));
-        Self { key, counter: AtomicU64::new(1) }
+
+        let unbound = ring::aead::UnboundKey::new(&ring::aead::AES_256_GCM, &derived).unwrap();
+        let seal_key = ring::aead::LessSafeKey::new(unbound);
+        let unbound2 = ring::aead::UnboundKey::new(&ring::aead::AES_256_GCM, &derived).unwrap();
+        let open_key = ring::aead::LessSafeKey::new(unbound2);
+
+        Self { seal_key, open_key, counter: AtomicU64::new(1) }
     }
 
     fn encrypt(&self, data: &[u8]) -> Vec<u8> {
-        use aes_gcm::AeadInPlace;
         let ctr = self.counter.fetch_add(1, Ordering::Relaxed);
         let mut nonce_bytes = [0u8; 12];
         nonce_bytes[4..12].copy_from_slice(&ctr.to_be_bytes());
-        let nonce = aes_gcm::Nonce::from(nonce_bytes);
+        let nonce = ring::aead::Nonce::assume_unique_for_key(nonce_bytes);
+
         let mut buf = data.to_vec();
-        let tag = self.key.encrypt_in_place_detached(&nonce, &[], &mut buf).expect("encrypt");
-        let mut out = Vec::with_capacity(8 + buf.len() + 16);
+        self.seal_key.seal_in_place_append_tag(nonce, ring::aead::Aad::empty(), &mut buf).unwrap();
+
+        let mut out = Vec::with_capacity(8 + buf.len());
         out.extend_from_slice(&ctr.to_be_bytes());
         out.extend_from_slice(&buf);
-        out.extend_from_slice(&tag);
         out
     }
 
     fn decrypt(&self, data: &[u8]) -> Option<Vec<u8>> {
-        use aes_gcm::AeadInPlace;
         if data.len() < 24 { return None; }
-        let ctr = u64::from_be_bytes([data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7]]);
-        let tag_start = data.len() - 16;
-        let mut buf = data[8..tag_start].to_vec();
-        let tag = aes_gcm::Tag::from_slice(&data[tag_start..]);
         let mut nonce_bytes = [0u8; 12];
-        nonce_bytes[4..12].copy_from_slice(&ctr.to_be_bytes());
-        let nonce = aes_gcm::Nonce::from(nonce_bytes);
-        self.key.decrypt_in_place_detached(&nonce, &[], &mut buf, tag).ok()?;
-        Some(buf)
+        nonce_bytes[4..12].copy_from_slice(&data[..8]);
+        let nonce = ring::aead::Nonce::assume_unique_for_key(nonce_bytes);
+
+        let mut buf = data[8..].to_vec();
+        let plaintext = self.open_key.open_in_place(nonce, ring::aead::Aad::empty(), &mut buf).ok()?;
+        Some(plaintext.to_vec())
     }
 }
 
@@ -336,8 +338,13 @@ fn handle_frame(
     let decrypted;
     let payload = if frame_type == FRAME_DATA {
         if let Some(ref c) = crypto {
-            decrypted = c.decrypt(payload).unwrap_or_default();
-            &decrypted
+            match c.decrypt(payload) {
+                Some(d) => { decrypted = d; &decrypted }
+                None => {
+                    eprintln!("[client] decrypt FAILED! payload_len={}", payload.len());
+                    return;
+                }
+            }
         } else { payload }
     } else { payload };
     match frame_type {
@@ -412,7 +419,7 @@ fn tunnel_writer_condvar<W: Write>(mut writer: W, queue: Arc<(Mutex<Vec<Vec<u8>>
         let frames: Vec<Vec<u8>> = {
             let mut q = queue.0.lock().unwrap();
             if q.is_empty() {
-                let (q2, _) = queue.1.wait_timeout(q, Duration::from_millis(5)).unwrap();
+                let (q2, _) = queue.1.wait_timeout(q, Duration::from_millis(1)).unwrap();
                 q = q2;
             }
             if q.is_empty() { continue; }
@@ -464,7 +471,7 @@ fn backend_reader_simple(
                 }
                 write_queue.1.notify_one();
                 // After first data, use short timeout for subsequent reads
-                backend.set_read_timeout(Some(Duration::from_secs(2))).ok();
+                backend.set_read_timeout(Some(Duration::from_millis(200))).ok();
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock
                 || e.kind() == std::io::ErrorKind::TimedOut => {
