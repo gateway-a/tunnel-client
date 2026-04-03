@@ -104,7 +104,50 @@ fn decode_frame(data: &[u8]) -> Option<(u8, u32, usize, &[u8])> {
 fn main() {
     let args = parse_args();
     let running = Arc::new(AtomicBool::new(true));
+    let backend_healthy = Arc::new(AtomicBool::new(true));
     setup_signal_handler(&running);
+
+    // Health check thread
+    if let Some(ref health_path) = args.health_path {
+        let target = args.target.clone();
+        let path = health_path.clone();
+        let interval = args.health_interval;
+        let restart_cmd = args.restart_cmd.clone();
+        let healthy = Arc::clone(&backend_healthy);
+        let run = Arc::clone(&running);
+        let mut consecutive_failures = 0u32;
+
+        std::thread::spawn(move || {
+            loop {
+                if !run.load(Ordering::Relaxed) { break; }
+                std::thread::sleep(Duration::from_secs(interval));
+
+                let ok = check_backend_health(&target, &path);
+                if ok {
+                    if !healthy.load(Ordering::Relaxed) {
+                        eprintln!("[health] backend recovered");
+                    }
+                    healthy.store(true, Ordering::Relaxed);
+                    consecutive_failures = 0;
+                } else {
+                    consecutive_failures += 1;
+                    eprintln!("[health] backend check failed ({}x)", consecutive_failures);
+                    healthy.store(false, Ordering::Relaxed);
+
+                    if consecutive_failures >= 3 {
+                        if let Some(ref cmd) = restart_cmd {
+                            eprintln!("[health] restarting backend: {}", cmd);
+                            let _ = std::process::Command::new("sh")
+                                .args(["-c", cmd])
+                                .status();
+                            consecutive_failures = 0;
+                            std::thread::sleep(Duration::from_secs(5));
+                        }
+                    }
+                }
+            }
+        });
+    }
 
     let mut backoff = RECONNECT_BASE_MS;
 
@@ -126,6 +169,29 @@ fn main() {
             eprintln!("[tunnel] reconnecting in {}ms...", backoff);
             std::thread::sleep(Duration::from_millis(backoff));
         }
+    }
+}
+
+fn check_backend_health(target: &str, path: &str) -> bool {
+    use std::io::{Read, Write};
+    let addr: std::net::SocketAddr = match target.parse() {
+        Ok(a) => a,
+        Err(_) => return false,
+    };
+    let mut stream = match TcpStream::connect_timeout(&addr, Duration::from_secs(3)) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    stream.set_read_timeout(Some(Duration::from_secs(3))).ok();
+    let req = format!("GET {} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n", path);
+    if stream.write_all(req.as_bytes()).is_err() { return false; }
+    let mut buf = [0u8; 256];
+    match stream.read(&mut buf) {
+        Ok(n) if n > 12 => {
+            let resp = String::from_utf8_lossy(&buf[..n]);
+            resp.contains("200") || resp.contains("204")
+        }
+        _ => false,
     }
 }
 
@@ -529,6 +595,10 @@ struct Args {
     insecure: bool,
     cert: Option<String>,
     key: Option<String>,
+    health_path: Option<String>,
+    health_interval: u64,
+    restart_cmd: Option<String>,
+    timeout: u64,
 }
 
 fn parse_args() -> Args {
@@ -541,6 +611,10 @@ fn parse_args() -> Args {
     let mut insecure = false;
     let mut cert: Option<String> = None;
     let mut key: Option<String> = None;
+    let mut health_path: Option<String> = None;
+    let mut health_interval: u64 = 30;
+    let mut restart_cmd: Option<String> = None;
+    let mut timeout: u64 = 30;
 
     let mut i = 1;
     while i < args.len() {
@@ -553,16 +627,24 @@ fn parse_args() -> Args {
             "--key" => { i += 1; if i < args.len() { key = Some(args[i].clone()); } }
             "--tls" => { tls = true; }
             "--insecure" | "-k" => { insecure = true; tls = true; }
+            "--health" => { i += 1; if i < args.len() { health_path = Some(args[i].clone()); } }
+            "--health-interval" => { i += 1; if i < args.len() { health_interval = args[i].parse().unwrap_or(30); } }
+            "--restart-cmd" => { i += 1; if i < args.len() { restart_cmd = Some(args[i].clone()); } }
+            "--timeout" => { i += 1; if i < args.len() { timeout = args[i].parse().unwrap_or(30); } }
             "--help" | "-h" => {
                 eprintln!("Usage: gateway-tunnel [OPTIONS]");
-                eprintln!("  -s, --server HOST:PORT  Tunnel server address");
-                eprintln!("  -n, --name   NAME       Tunnel name");
-                eprintln!("  -t, --token  TOKEN      Auth token");
-                eprintln!("  -T, --target HOST:PORT  Local service (default: 127.0.0.1:3000)");
-                eprintln!("  --tls                   Enable TLS");
-                eprintln!("  --cert FILE             Client certificate (enables mTLS)");
-                eprintln!("  --key FILE              Client private key");
-                eprintln!("  --insecure, -k          Skip server cert verification");
+                eprintln!("  -s, --server HOST:PORT   Tunnel server address");
+                eprintln!("  -n, --name   NAME        Tunnel name");
+                eprintln!("  -t, --token  TOKEN       Auth token");
+                eprintln!("  -T, --target HOST:PORT   Local service (default: 127.0.0.1:3000)");
+                eprintln!("  --tls                    Enable TLS");
+                eprintln!("  --cert FILE              Client certificate (enables mTLS)");
+                eprintln!("  --key FILE               Client private key");
+                eprintln!("  --insecure, -k           Skip server cert verification");
+                eprintln!("  --health PATH            Health check path (e.g. /health)");
+                eprintln!("  --health-interval SECS   Health check interval (default: 30)");
+                eprintln!("  --restart-cmd CMD        Restart backend on health failure");
+                eprintln!("  --timeout SECS           Request timeout (default: 30)");
                 std::process::exit(0);
             }
             _ => { if server.is_empty() { server = args[i].clone(); } }
@@ -577,13 +659,15 @@ fn parse_args() -> Args {
     if !tls && std::env::var("TUNNEL_TLS").map(|v| v == "true" || v == "1").unwrap_or(false) { tls = true; }
     if cert.is_none() { cert = std::env::var("TUNNEL_CERT").ok(); if cert.is_some() { tls = true; } }
     if key.is_none() { key = std::env::var("TUNNEL_KEY").ok(); }
+    if health_path.is_none() { health_path = std::env::var("TUNNEL_HEALTH").ok(); }
+    if restart_cmd.is_none() { restart_cmd = std::env::var("TUNNEL_RESTART_CMD").ok(); }
 
     if server.is_empty() || name.is_empty() {
         eprintln!("Error: --server and --name required");
         std::process::exit(1);
     }
 
-    Args { server, name, token, target, tls, insecure, cert, key }
+    Args { server, name, token, target, tls, insecure, cert, key, health_path, health_interval, restart_cmd, timeout }
 }
 
 #[cfg(test)]
