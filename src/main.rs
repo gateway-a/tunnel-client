@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 // --- Frame encryption ---
@@ -11,6 +11,7 @@ use std::sync::atomic::AtomicU64;
 
 struct FrameCrypto {
     key: [u8; 32],
+    nonce_prefix: [u8; 4],
     counter: AtomicU64,
 }
 
@@ -23,13 +24,22 @@ impl FrameCrypto {
         let derived = mac.finalize().into_bytes();
         let mut key = [0u8; 32];
         key.copy_from_slice(&derived);
-        Self { key, counter: AtomicU64::new(1) }
+        static INSTANCE_CTR: AtomicU64 = AtomicU64::new(0);
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        let unique = ts ^ INSTANCE_CTR.fetch_add(1, Ordering::Relaxed);
+        let mut nonce_prefix = [0u8; 4];
+        nonce_prefix.copy_from_slice(&unique.to_be_bytes()[..4]);
+        Self { key, nonce_prefix, counter: AtomicU64::new(1) }
     }
 
     fn encrypt(&self, data: &[u8]) -> Vec<u8> {
         use chacha20poly1305::{ChaCha20Poly1305, KeyInit, AeadInPlace};
         let ctr = self.counter.fetch_add(1, Ordering::Relaxed);
         let mut nonce_bytes = [0u8; 12];
+        nonce_bytes[0..4].copy_from_slice(&self.nonce_prefix);
         nonce_bytes[4..12].copy_from_slice(&ctr.to_be_bytes());
 
         let cipher = ChaCha20Poly1305::new(chacha20poly1305::Key::from_slice(&self.key));
@@ -38,7 +48,8 @@ impl FrameCrypto {
         let mut buf = data.to_vec();
         let tag = cipher.encrypt_in_place_detached(&nonce, &[], &mut buf).expect("encrypt");
 
-        let mut out = Vec::with_capacity(8 + buf.len() + 16);
+        let mut out = Vec::with_capacity(4 + 8 + buf.len() + 16);
+        out.extend_from_slice(&self.nonce_prefix);
         out.extend_from_slice(&ctr.to_be_bytes());
         out.extend_from_slice(&buf);
         out.extend_from_slice(&tag);
@@ -47,15 +58,16 @@ impl FrameCrypto {
 
     fn decrypt(&self, data: &[u8]) -> Option<Vec<u8>> {
         use chacha20poly1305::{ChaCha20Poly1305, KeyInit, AeadInPlace};
-        if data.len() < 24 { return None; }
+        if data.len() < 28 { return None; }
         let mut nonce_bytes = [0u8; 12];
-        nonce_bytes[4..12].copy_from_slice(&data[..8]);
+        nonce_bytes[0..4].copy_from_slice(&data[0..4]);
+        nonce_bytes[4..12].copy_from_slice(&data[4..12]);
 
         let cipher = ChaCha20Poly1305::new(chacha20poly1305::Key::from_slice(&self.key));
         let nonce = chacha20poly1305::Nonce::from(nonce_bytes);
 
         let tag_start = data.len() - 16;
-        let mut buf = data[8..tag_start].to_vec();
+        let mut buf = data[12..tag_start].to_vec();
         let tag = chacha20poly1305::Tag::from_slice(&data[tag_start..]);
 
         cipher.decrypt_in_place_detached(&nonce, &[], &mut buf, tag).ok()?;
@@ -78,6 +90,7 @@ const FRAME_HEADER_LEN: usize = 9;
 const READ_BUF_SIZE: usize = 65536;
 const RECONNECT_BASE_MS: u64 = 1000;
 const RECONNECT_MAX_MS: u64 = 30000;
+const IDLE_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn encode_frame(frame_type: u8, stream_id: u32, payload: &[u8]) -> Vec<u8> {
     let mut buf = Vec::with_capacity(FRAME_HEADER_LEN + payload.len());
@@ -97,6 +110,45 @@ fn decode_frame(data: &[u8]) -> Option<(u8, u32, usize, &[u8])> {
     let total = FRAME_HEADER_LEN + payload_len;
     if data.len() < total { return None; }
     Some((frame_type, stream_id, total, &data[FRAME_HEADER_LEN..total]))
+}
+
+fn lock_safe<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn enable_keepalive(stream: &TcpStream) {
+    use std::os::unix::io::AsRawFd;
+    let fd = stream.as_raw_fd();
+    unsafe {
+        let on: libc::c_int = 1;
+        libc::setsockopt(
+            fd, libc::SOL_SOCKET, libc::SO_KEEPALIVE,
+            &on as *const _ as *const libc::c_void,
+            std::mem::size_of_val(&on) as libc::socklen_t,
+        );
+        #[cfg(target_os = "linux")]
+        let keepidle_opt = libc::TCP_KEEPIDLE;
+        #[cfg(target_os = "macos")]
+        let keepidle_opt = libc::TCP_KEEPALIVE;
+        let idle: libc::c_int = 30;
+        libc::setsockopt(
+            fd, libc::IPPROTO_TCP, keepidle_opt,
+            &idle as *const _ as *const libc::c_void,
+            std::mem::size_of_val(&idle) as libc::socklen_t,
+        );
+        let intvl: libc::c_int = 10;
+        libc::setsockopt(
+            fd, libc::IPPROTO_TCP, libc::TCP_KEEPINTVL,
+            &intvl as *const _ as *const libc::c_void,
+            std::mem::size_of_val(&intvl) as libc::socklen_t,
+        );
+        let cnt: libc::c_int = 3;
+        libc::setsockopt(
+            fd, libc::IPPROTO_TCP, libc::TCP_KEEPCNT,
+            &cnt as *const _ as *const libc::c_void,
+            std::mem::size_of_val(&cnt) as libc::socklen_t,
+        );
+    }
 }
 
 // --- Main ---
@@ -154,13 +206,21 @@ fn main() {
     while running.load(Ordering::Relaxed) {
         eprintln!("[tunnel] connecting to {} as '{}'...", args.server, args.name);
 
-        match run_tunnel(&args, &running) {
-            Ok(()) => {
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_tunnel(&args, &running)
+        }));
+
+        match outcome {
+            Ok(Ok(())) => {
                 eprintln!("[tunnel] disconnected");
                 backoff = RECONNECT_BASE_MS;
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 eprintln!("[tunnel] error: {}", e);
+                backoff = (backoff * 2).min(RECONNECT_MAX_MS);
+            }
+            Err(_) => {
+                eprintln!("[tunnel] panic recovered — reconnecting");
                 backoff = (backoff * 2).min(RECONNECT_MAX_MS);
             }
         }
@@ -201,6 +261,7 @@ fn run_tunnel(args: &Args, running: &AtomicBool) -> Result<(), String> {
         Duration::from_secs(10),
     ).map_err(|e| format!("connect: {}", e))?;
     tcp.set_nodelay(true).ok();
+    enable_keepalive(&tcp);
 
     if args.tls {
         let tls_config = build_tls_config(args.insecure, &args.cert, &args.key);
@@ -310,6 +371,7 @@ fn run_tunnel_tls_loop<S: Read + Write>(
 
     let mut buffer = Vec::with_capacity(READ_BUF_SIZE);
     let mut read_buf = [0u8; READ_BUF_SIZE];
+    let mut last_read = std::time::Instant::now();
 
     while !closed.load(Ordering::Relaxed) && running.load(Ordering::Relaxed) {
         let frames: Vec<Vec<u8>> = {
@@ -324,9 +386,18 @@ fn run_tunnel_tls_loop<S: Read + Write>(
 
         match stream.read(&mut read_buf) {
             Ok(0) => break,
-            Ok(n) => buffer.extend_from_slice(&read_buf[..n]),
+            Ok(n) => {
+                last_read = std::time::Instant::now();
+                buffer.extend_from_slice(&read_buf[..n]);
+            }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock
-                || e.kind() == std::io::ErrorKind::TimedOut => { continue; }
+                || e.kind() == std::io::ErrorKind::TimedOut => {
+                if last_read.elapsed() > IDLE_READ_TIMEOUT {
+                    eprintln!("[client] tunnel idle > {:?}, treating as dead", IDLE_READ_TIMEOUT);
+                    break;
+                }
+                continue;
+            }
             Err(_) => break,
         }
 
@@ -355,12 +426,18 @@ fn run_tunnel_on_stream(mut stream: TcpStream, args: &Args, running: &AtomicBool
         Some(Arc::new(FrameCrypto::from_token(&args.token)))
     } else { None };
 
-    // Writer thread: drains write_queue → tunnel stream
     let writer_stream = stream.try_clone().map_err(|e| format!("clone: {}", e))?;
     let wq_writer = Arc::clone(&write_queue);
     let closed_writer = Arc::clone(&closed);
     let writer = std::thread::spawn(move || {
-        tunnel_writer_condvar(writer_stream, wq_writer, closed_writer);
+        let closed_signal = Arc::clone(&closed_writer);
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            tunnel_writer_condvar(writer_stream, wq_writer, closed_writer);
+        }));
+        if r.is_err() {
+            eprintln!("[client-writer] panic recovered");
+        }
+        closed_signal.store(true, Ordering::Release);
     });
 
     // Reader: main thread reads from tunnel stream
@@ -369,13 +446,24 @@ fn run_tunnel_on_stream(mut stream: TcpStream, args: &Args, running: &AtomicBool
 
     let mut buffer = Vec::with_capacity(READ_BUF_SIZE);
     let mut read_buf = [0u8; READ_BUF_SIZE];
+    let mut last_read = std::time::Instant::now();
 
     while !closed.load(Ordering::Relaxed) && running.load(Ordering::Relaxed) {
         match stream.read(&mut read_buf) {
             Ok(0) => { eprintln!("[client] tunnel EOF"); break; }
-            Ok(n) => { eprintln!("[client] tunnel read {} bytes", n); buffer.extend_from_slice(&read_buf[..n]); }
+            Ok(n) => {
+                last_read = std::time::Instant::now();
+                eprintln!("[client] tunnel read {} bytes", n);
+                buffer.extend_from_slice(&read_buf[..n]);
+            }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock
-                || e.kind() == std::io::ErrorKind::TimedOut => { continue; }
+                || e.kind() == std::io::ErrorKind::TimedOut => {
+                if last_read.elapsed() > IDLE_READ_TIMEOUT {
+                    eprintln!("[client] tunnel idle > {:?}, treating as dead", IDLE_READ_TIMEOUT);
+                    break;
+                }
+                continue;
+            }
             Err(e) => { eprintln!("[client] tunnel read error: {}", e); break; }
         }
 
@@ -431,12 +519,12 @@ fn handle_frame(
                 }
                 Err(_) => (None, None),
             };
-            let mut s = streams_map.lock().unwrap();
+            let mut s = lock_safe(streams_map);
             s.insert(stream_id, StreamState { backend_writer: bw, backend_reader: br });
         }
         FRAME_DATA => {
             let start_reader = {
-                let mut s = streams_map.lock().unwrap();
+                let mut s = lock_safe(streams_map);
                 if let Some(state) = s.get_mut(&stream_id) {
                     if let Some(ref mut bw) = state.backend_writer {
                         let _ = bw.write_all(payload);
@@ -450,10 +538,12 @@ fn handle_frame(
                 let cl = Arc::clone(closed);
                 let cr = crypto.clone();
                 std::thread::spawn(move || {
-                    backend_reader_simple(stream_id, reader_stream, wq, cl, cr);
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        backend_reader_simple(stream_id, reader_stream, wq, cl, cr);
+                    }));
                 });
             } else {
-                let s = streams_map.lock().unwrap();
+                let s = lock_safe(streams_map);
                 if let Some(state) = s.get(&stream_id) {
                     if state.backend_writer.is_none() {
                         let resp = b"HTTP/1.1 502 Bad Gateway\r\ncontent-length: 0\r\n\r\n";
@@ -466,7 +556,7 @@ fn handle_frame(
             }
         }
         FRAME_CLOSE => {
-            let mut s = streams_map.lock().unwrap();
+            let mut s = lock_safe(streams_map);
             if let Some(state) = s.remove(&stream_id) {
                 if let Some(bw) = state.backend_writer {
                     let _ = bw.shutdown(std::net::Shutdown::Both);
@@ -488,9 +578,11 @@ fn tunnel_writer_condvar<W: Write>(mut writer: W, queue: Arc<(Mutex<Vec<Vec<u8>>
     loop {
         if closed.load(Ordering::Relaxed) { break; }
         let frames: Vec<Vec<u8>> = {
-            let mut q = queue.0.lock().unwrap();
+            let mut q = lock_safe(&queue.0);
             if q.is_empty() {
-                let (q2, _) = queue.1.wait_timeout(q, Duration::from_millis(1)).unwrap();
+                let (q2, _) = queue.1
+                    .wait_timeout(q, Duration::from_millis(1))
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
                 q = q2;
             }
             if q.is_empty() { continue; }
@@ -522,6 +614,9 @@ fn backend_reader_simple(
 ) {
     let mut buf = [0u8; 32768];
     let mut got_data = false;
+    let mut header_buf: Vec<u8> = Vec::with_capacity(2048);
+    let mut headers_parsed = false;
+    let mut subsequent_timeout = Duration::from_millis(200);
 
     // First read: wait up to 30s for response start
     backend.set_read_timeout(Some(Duration::from_secs(30))).ok();
@@ -532,6 +627,29 @@ fn backend_reader_simple(
             Ok(0) => break,
             Ok(n) => {
                 got_data = true;
+                if !headers_parsed {
+                    header_buf.extend_from_slice(&buf[..n.min(2048)]);
+                    if let Some(end) = header_buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                        headers_parsed = true;
+                        let head = &header_buf[..end];
+                        if let Ok(s) = std::str::from_utf8(head) {
+                            let lower = s.to_ascii_lowercase();
+                            let is_sse = lower.contains("content-type: text/event-stream")
+                                || lower.contains("content-type:text/event-stream");
+                            let is_chunked = lower.contains("transfer-encoding: chunked")
+                                || lower.contains("transfer-encoding:chunked");
+                            if is_sse {
+                                subsequent_timeout = Duration::from_secs(600);
+                            } else if is_chunked {
+                                subsequent_timeout = Duration::from_secs(30);
+                            }
+                        }
+                        header_buf.clear();
+                        header_buf.shrink_to_fit();
+                    } else if header_buf.len() > 2048 {
+                        headers_parsed = true;
+                    }
+                }
                 let frame_payload = if let Some(ref c) = crypto {
                     c.encrypt(&buf[..n])
                 } else {
@@ -541,8 +659,7 @@ fn backend_reader_simple(
                     q.push(encode_frame(FRAME_DATA, stream_id, &frame_payload));
                 }
                 write_queue.1.notify_one();
-                // After first data, use short timeout for subsequent reads
-                backend.set_read_timeout(Some(Duration::from_millis(200))).ok();
+                backend.set_read_timeout(Some(subsequent_timeout)).ok();
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock
                 || e.kind() == std::io::ErrorKind::TimedOut => {
