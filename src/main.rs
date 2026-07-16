@@ -7,12 +7,9 @@ use std::time::Duration;
 
 // --- Frame encryption ---
 
-use std::sync::atomic::AtomicU64;
 
 struct FrameCrypto {
     key: [u8; 32],
-    nonce_prefix: [u8; 4],
-    counter: AtomicU64,
 }
 
 impl FrameCrypto {
@@ -24,23 +21,17 @@ impl FrameCrypto {
         let derived = mac.finalize().into_bytes();
         let mut key = [0u8; 32];
         key.copy_from_slice(&derived);
-        static INSTANCE_CTR: AtomicU64 = AtomicU64::new(0);
-        let ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos() as u64)
-            .unwrap_or(0);
-        let unique = ts ^ INSTANCE_CTR.fetch_add(1, Ordering::Relaxed);
-        let mut nonce_prefix = [0u8; 4];
-        nonce_prefix.copy_from_slice(&unique.to_be_bytes()[..4]);
-        Self { key, nonce_prefix, counter: AtomicU64::new(1) }
+        Self { key }
     }
 
     fn encrypt(&self, data: &[u8]) -> Vec<u8> {
         use chacha20poly1305::{ChaCha20Poly1305, KeyInit, AeadInPlace};
-        let ctr = self.counter.fetch_add(1, Ordering::Relaxed);
+        // The key is derived from the shared token, so every frame MUST use a
+        // fresh random nonce or ChaCha20-Poly1305 breaks (nonce reuse leaks
+        // plaintext + allows tag forgery). The nonce travels in the frame, so
+        // the peer reads it back — no shared counter state needed.
         let mut nonce_bytes = [0u8; 12];
-        nonce_bytes[0..4].copy_from_slice(&self.nonce_prefix);
-        nonce_bytes[4..12].copy_from_slice(&ctr.to_be_bytes());
+        getrandom::getrandom(&mut nonce_bytes).expect("csprng");
 
         let cipher = ChaCha20Poly1305::new(chacha20poly1305::Key::from_slice(&self.key));
         let nonce = chacha20poly1305::Nonce::from(nonce_bytes);
@@ -48,9 +39,8 @@ impl FrameCrypto {
         let mut buf = data.to_vec();
         let tag = cipher.encrypt_in_place_detached(&nonce, &[], &mut buf).expect("encrypt");
 
-        let mut out = Vec::with_capacity(4 + 8 + buf.len() + 16);
-        out.extend_from_slice(&self.nonce_prefix);
-        out.extend_from_slice(&ctr.to_be_bytes());
+        let mut out = Vec::with_capacity(12 + buf.len() + 16);
+        out.extend_from_slice(&nonce_bytes);
         out.extend_from_slice(&buf);
         out.extend_from_slice(&tag);
         out
