@@ -5,6 +5,19 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
+fn verbose() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("TUNNEL_VERBOSE")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    })
+}
+
+macro_rules! vlog {
+    ($($arg:tt)*) => { if verbose() { eprintln!($($arg)*); } };
+}
+
 // --- Frame encryption ---
 
 
@@ -13,15 +26,15 @@ struct FrameCrypto {
 }
 
 impl FrameCrypto {
-    fn from_token(token: &str) -> Self {
+    fn from_token(token: &str) -> Result<Self, String> {
         use hmac::Mac;
         let mut mac = <hmac::Hmac<sha2::Sha256> as Mac>::new_from_slice(token.as_bytes())
-            .unwrap_or_else(|_| <hmac::Hmac<sha2::Sha256> as Mac>::new_from_slice(b"default").unwrap());
-        mac.update(b"tunnel-frame-encryption-key-v1");
+            .map_err(|e| format!("frame key init: {}", e))?;
+        mac.update(FRAME_KEY_LABEL);
         let derived = mac.finalize().into_bytes();
         let mut key = [0u8; 32];
         key.copy_from_slice(&derived);
-        Self { key }
+        Ok(Self { key })
     }
 
     fn encrypt(&self, data: &[u8]) -> Vec<u8> {
@@ -81,6 +94,48 @@ const READ_BUF_SIZE: usize = 65536;
 const RECONNECT_BASE_MS: u64 = 1000;
 const RECONNECT_MAX_MS: u64 = 30000;
 const IDLE_READ_TIMEOUT: Duration = Duration::from_secs(30);
+const DEFAULT_TARGET: &str = "127.0.0.1:3000";
+const FRAME_KEY_LABEL: &[u8] = b"tunnel-frame-encryption-key-v1";
+const WRITE_QUEUE_MAX_BYTES: usize = 16 * 1024 * 1024;
+
+fn build_crypto(token: &str) -> Result<Option<Arc<FrameCrypto>>, String> {
+    if token.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(Arc::new(FrameCrypto::from_token(token)?)))
+    }
+}
+
+fn resolve_target(target: &str) -> Result<std::net::SocketAddr, String> {
+    use std::net::ToSocketAddrs;
+    target
+        .to_socket_addrs()
+        .map_err(|e| format!("invalid --target '{}': {}", target, e))?
+        .next()
+        .ok_or_else(|| format!("--target '{}' resolved to no addresses", target))
+}
+
+fn enqueue_frame(
+    queue: &(Mutex<Vec<Vec<u8>>>, std::sync::Condvar),
+    frame: Vec<u8>,
+    closed: &AtomicBool,
+) {
+    let mut q = lock_safe(&queue.0);
+    let mut queued: usize = q.iter().map(|f| f.len()).sum();
+    while queued + frame.len() > WRITE_QUEUE_MAX_BYTES
+        && !q.is_empty()
+        && !closed.load(Ordering::Relaxed)
+    {
+        let (g, _) = queue
+            .1
+            .wait_timeout(q, Duration::from_millis(50))
+            .unwrap_or_else(|p| p.into_inner());
+        q = g;
+        queued = q.iter().map(|f| f.len()).sum();
+    }
+    q.push(frame);
+    queue.1.notify_all();
+}
 
 fn encode_frame(frame_type: u8, stream_id: u32, payload: &[u8]) -> Vec<u8> {
     let mut buf = Vec::with_capacity(FRAME_HEADER_LEN + payload.len());
@@ -149,9 +204,13 @@ fn main() {
     let backend_healthy = Arc::new(AtomicBool::new(true));
     setup_signal_handler(&running);
 
+    if args.insecure {
+        eprintln!("[tunnel] WARNING: TLS certificate verification disabled (--insecure); the connection is vulnerable to man-in-the-middle attacks");
+    }
+
     // Health check thread
     if let Some(ref health_path) = args.health_path {
-        let target = args.target.clone();
+        let target = args.target;
         let path = health_path.clone();
         let interval = args.health_interval;
         let restart_cmd = args.restart_cmd.clone();
@@ -164,21 +223,21 @@ fn main() {
                 if !run.load(Ordering::Relaxed) { break; }
                 std::thread::sleep(Duration::from_secs(interval));
 
-                let ok = check_backend_health(&target, &path);
+                let ok = check_backend_health(target, &path);
                 if ok {
                     if !healthy.load(Ordering::Relaxed) {
-                        eprintln!("[health] backend recovered");
+                        vlog!("[health] backend recovered");
                     }
                     healthy.store(true, Ordering::Relaxed);
                     consecutive_failures = 0;
                 } else {
                     consecutive_failures += 1;
-                    eprintln!("[health] backend check failed ({}x)", consecutive_failures);
+                    vlog!("[health] backend check failed ({}x)", consecutive_failures);
                     healthy.store(false, Ordering::Relaxed);
 
                     if consecutive_failures >= 3 {
                         if let Some(ref cmd) = restart_cmd {
-                            eprintln!("[health] restarting backend: {}", cmd);
+                            vlog!("[health] restarting backend: {}", cmd);
                             let _ = std::process::Command::new("sh")
                                 .args(["-c", cmd])
                                 .status();
@@ -194,7 +253,7 @@ fn main() {
     let mut backoff = RECONNECT_BASE_MS;
 
     while running.load(Ordering::Relaxed) {
-        eprintln!("[tunnel] connecting to {} as '{}'...", args.server, args.name);
+        vlog!("[tunnel] connecting to {} as '{}'...", args.server, args.name);
 
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             run_tunnel(&args, &running)
@@ -202,7 +261,7 @@ fn main() {
 
         match outcome {
             Ok(Ok(())) => {
-                eprintln!("[tunnel] disconnected");
+                vlog!("[tunnel] disconnected");
                 backoff = RECONNECT_BASE_MS;
             }
             Ok(Err(e)) => {
@@ -216,19 +275,15 @@ fn main() {
         }
 
         if running.load(Ordering::Relaxed) {
-            eprintln!("[tunnel] reconnecting in {}ms...", backoff);
+            vlog!("[tunnel] reconnecting in {}ms...", backoff);
             std::thread::sleep(Duration::from_millis(backoff));
         }
     }
 }
 
-fn check_backend_health(target: &str, path: &str) -> bool {
+fn check_backend_health(target: std::net::SocketAddr, path: &str) -> bool {
     use std::io::{Read, Write};
-    let addr: std::net::SocketAddr = match target.parse() {
-        Ok(a) => a,
-        Err(_) => return false,
-    };
-    let mut stream = match TcpStream::connect_timeout(&addr, Duration::from_secs(3)) {
+    let mut stream = match TcpStream::connect_timeout(&target, Duration::from_secs(3)) {
         Ok(s) => s,
         Err(_) => return false,
     };
@@ -255,7 +310,7 @@ fn run_tunnel(args: &Args, running: &AtomicBool) -> Result<(), String> {
 
     if args.tls {
         let tls_config = build_tls_config(args.insecure, &args.cert, &args.key);
-        let server_name = args.server.split(':').next().unwrap_or("localhost").to_string();
+        let server_name = extract_host(&args.server).to_string();
         let sni = rustls::pki_types::ServerName::try_from(server_name)
             .map_err(|e| format!("invalid SNI: {}", e))?;
         let tls_conn = rustls::ClientConnection::new(tls_config, sni)
@@ -266,7 +321,7 @@ fn run_tunnel(args: &Args, running: &AtomicBool) -> Result<(), String> {
         do_auth(&mut tls_stream, args)?;
 
         let has_cert = args.cert.is_some();
-        eprintln!("[tunnel] connected (TLS{})! forwarding to {}",
+        vlog!("[tunnel] connected (TLS{})! forwarding to {}",
             if has_cert { "+mTLS" } else { "" }, args.target);
 
         // For TLS we use single-thread read+write with timeout
@@ -324,7 +379,13 @@ impl rustls::client::danger::ServerCertVerifier for InsecureVerifier {
 }
 
 fn extract_host(s: &str) -> &str {
-    s.split(':').next().unwrap_or(s)
+    if let Some(rest) = s.strip_prefix('[') {
+        return rest.split(']').next().unwrap_or(rest);
+    }
+    match s.rsplit_once(':') {
+        Some((host, _)) if !host.contains(':') => host,
+        _ => s,
+    }
 }
 
 fn do_auth<S: Read + Write>(stream: &mut S, args: &Args) -> Result<(), String> {
@@ -355,9 +416,7 @@ fn run_tunnel_tls_loop<S: Read + Write>(
     let closed = Arc::new(AtomicBool::new(false));
     let streams_map: Arc<Mutex<HashMap<u32, StreamState>>> = Arc::new(Mutex::new(HashMap::new()));
     let write_queue: Arc<(Mutex<Vec<Vec<u8>>>, std::sync::Condvar)> = Arc::new((Mutex::new(Vec::new()), std::sync::Condvar::new()));
-    let crypto: Option<Arc<FrameCrypto>> = if !args.token.is_empty() {
-        Some(Arc::new(FrameCrypto::from_token(&args.token)))
-    } else { None };
+    let crypto = build_crypto(&args.token)?;
 
     let mut buffer = Vec::with_capacity(READ_BUF_SIZE);
     let mut read_buf = [0u8; READ_BUF_SIZE];
@@ -366,7 +425,11 @@ fn run_tunnel_tls_loop<S: Read + Write>(
     while !closed.load(Ordering::Relaxed) && running.load(Ordering::Relaxed) {
         let frames: Vec<Vec<u8>> = {
             match write_queue.0.lock() {
-                Ok(mut q) if !q.is_empty() => std::mem::take(&mut *q),
+                Ok(mut q) if !q.is_empty() => {
+                    let taken = std::mem::take(&mut *q);
+                    write_queue.1.notify_all();
+                    taken
+                }
                 _ => Vec::new(),
             }
         };
@@ -383,7 +446,7 @@ fn run_tunnel_tls_loop<S: Read + Write>(
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock
                 || e.kind() == std::io::ErrorKind::TimedOut => {
                 if last_read.elapsed() > IDLE_READ_TIMEOUT {
-                    eprintln!("[client] tunnel idle > {:?}, treating as dead", IDLE_READ_TIMEOUT);
+                    vlog!("[client] tunnel idle > {:?}, treating as dead", IDLE_READ_TIMEOUT);
                     break;
                 }
                 continue;
@@ -406,15 +469,13 @@ fn run_tunnel_tls_loop<S: Read + Write>(
 
 fn run_tunnel_on_stream(mut stream: TcpStream, args: &Args, running: &AtomicBool) -> Result<(), String> {
     do_auth(&mut stream, args)?;
-    eprintln!("[tunnel] connected (TCP)! forwarding to {}", args.target);
+    vlog!("[tunnel] connected (TCP)! forwarding to {}", args.target);
 
     let closed = Arc::new(AtomicBool::new(false));
     let streams_map: Arc<Mutex<HashMap<u32, StreamState>>> = Arc::new(Mutex::new(HashMap::new()));
     let write_queue: Arc<(Mutex<Vec<Vec<u8>>>, std::sync::Condvar)> =
         Arc::new((Mutex::new(Vec::new()), std::sync::Condvar::new()));
-    let crypto: Option<Arc<FrameCrypto>> = if !args.token.is_empty() {
-        Some(Arc::new(FrameCrypto::from_token(&args.token)))
-    } else { None };
+    let crypto = build_crypto(&args.token)?;
 
     let writer_stream = stream.try_clone().map_err(|e| format!("clone: {}", e))?;
     let wq_writer = Arc::clone(&write_queue);
@@ -440,21 +501,20 @@ fn run_tunnel_on_stream(mut stream: TcpStream, args: &Args, running: &AtomicBool
 
     while !closed.load(Ordering::Relaxed) && running.load(Ordering::Relaxed) {
         match stream.read(&mut read_buf) {
-            Ok(0) => { eprintln!("[client] tunnel EOF"); break; }
+            Ok(0) => { vlog!("[client] tunnel EOF"); break; }
             Ok(n) => {
                 last_read = std::time::Instant::now();
-                eprintln!("[client] tunnel read {} bytes", n);
                 buffer.extend_from_slice(&read_buf[..n]);
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock
                 || e.kind() == std::io::ErrorKind::TimedOut => {
                 if last_read.elapsed() > IDLE_READ_TIMEOUT {
-                    eprintln!("[client] tunnel idle > {:?}, treating as dead", IDLE_READ_TIMEOUT);
+                    vlog!("[client] tunnel idle > {:?}, treating as dead", IDLE_READ_TIMEOUT);
                     break;
                 }
                 continue;
             }
-            Err(e) => { eprintln!("[client] tunnel read error: {}", e); break; }
+            Err(e) => { vlog!("[client] tunnel read error: {}", e); break; }
         }
 
         loop {
@@ -490,7 +550,7 @@ fn handle_frame(
             match c.decrypt(payload) {
                 Some(d) => { decrypted = d; &decrypted }
                 None => {
-                    eprintln!("[client] decrypt FAILED! payload_len={} first16={:02x?}", payload.len(), &payload[..16.min(payload.len())]);
+                    vlog!("[client] frame decrypt failed (len={})", payload.len());
                     return;
                 }
             }
@@ -499,8 +559,8 @@ fn handle_frame(
     match frame_type {
         FRAME_OPEN => {
             let (bw, br) = match TcpStream::connect_timeout(
-                &args.target.parse().unwrap_or_else(|_| "127.0.0.1:3000".parse().unwrap()),
-                Duration::from_secs(5),
+                &args.target,
+                Duration::from_secs(args.timeout),
             ) {
                 Ok(s) => {
                     s.set_nodelay(true).ok();
@@ -527,9 +587,10 @@ fn handle_frame(
                 let wq = Arc::clone(write_queue);
                 let cl = Arc::clone(closed);
                 let cr = crypto.clone();
+                let read_timeout = Duration::from_secs(args.timeout);
                 std::thread::spawn(move || {
                     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        backend_reader_simple(stream_id, reader_stream, wq, cl, cr);
+                        backend_reader_simple(stream_id, reader_stream, wq, cl, cr, read_timeout);
                     }));
                 });
             } else {
@@ -564,7 +625,7 @@ fn handle_frame(
 }
 
 fn tunnel_writer_condvar<W: Write>(mut writer: W, queue: Arc<(Mutex<Vec<Vec<u8>>>, std::sync::Condvar)>, closed: Arc<AtomicBool>) {
-    eprintln!("[client-writer] started");
+    vlog!("[client-writer] started");
     loop {
         if closed.load(Ordering::Relaxed) { break; }
         let frames: Vec<Vec<u8>> = {
@@ -576,18 +637,19 @@ fn tunnel_writer_condvar<W: Write>(mut writer: W, queue: Arc<(Mutex<Vec<Vec<u8>>
                 q = q2;
             }
             if q.is_empty() { continue; }
-            std::mem::take(&mut *q)
+            let taken = std::mem::take(&mut *q);
+            queue.1.notify_all();
+            taken
         };
         let mut batch = Vec::with_capacity(frames.iter().map(|f| f.len()).sum());
         for f in frames { batch.extend_from_slice(&f); }
-        eprintln!("[client-writer] flushing {} bytes", batch.len());
         if writer.write_all(&batch).is_err() {
-            eprintln!("[client-writer] write error!");
+            vlog!("[client-writer] write error");
             closed.store(true, Ordering::Release);
             return;
         }
     }
-    eprintln!("[client-writer] exited");
+    vlog!("[client-writer] exited");
 }
 
 struct StreamState {
@@ -601,6 +663,7 @@ fn backend_reader_simple(
     write_queue: Arc<(Mutex<Vec<Vec<u8>>>, std::sync::Condvar)>,
     closed: Arc<AtomicBool>,
     crypto: Option<Arc<FrameCrypto>>,
+    first_read_timeout: Duration,
 ) {
     let mut buf = [0u8; 32768];
     let mut got_data = false;
@@ -608,8 +671,7 @@ fn backend_reader_simple(
     let mut headers_parsed = false;
     let mut subsequent_timeout = Duration::from_millis(200);
 
-    // First read: wait up to 30s for response start
-    backend.set_read_timeout(Some(Duration::from_secs(30))).ok();
+    backend.set_read_timeout(Some(first_read_timeout)).ok();
 
     loop {
         if closed.load(Ordering::Relaxed) { break; }
@@ -645,10 +707,7 @@ fn backend_reader_simple(
                 } else {
                     buf[..n].to_vec()
                 };
-                if let Ok(mut q) = write_queue.0.lock() {
-                    q.push(encode_frame(FRAME_DATA, stream_id, &frame_payload));
-                }
-                write_queue.1.notify_one();
+                enqueue_frame(&write_queue, encode_frame(FRAME_DATA, stream_id, &frame_payload), &closed);
                 backend.set_read_timeout(Some(subsequent_timeout)).ok();
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock
@@ -671,14 +730,11 @@ fn backend_reader_simple(
 // --- Signal handling ---
 
 fn setup_signal_handler(running: &Arc<AtomicBool>) {
-    let r = Arc::clone(running);
-    std::thread::spawn(move || {
-        unsafe {
-            libc::signal(libc::SIGINT, sig_handler as libc::sighandler_t);
-            libc::signal(libc::SIGTERM, sig_handler as libc::sighandler_t);
-        }
-        RUNNING_PTR.store(Arc::into_raw(r) as *mut _, Ordering::Release);
-    });
+    RUNNING_PTR.store(Arc::as_ptr(running) as *mut _, Ordering::Release);
+    unsafe {
+        libc::signal(libc::SIGINT, sig_handler as libc::sighandler_t);
+        libc::signal(libc::SIGTERM, sig_handler as libc::sighandler_t);
+    }
 }
 
 static RUNNING_PTR: std::sync::atomic::AtomicPtr<AtomicBool> =
@@ -697,7 +753,7 @@ struct Args {
     server: String,
     name: String,
     token: String,
-    target: String,
+    target: std::net::SocketAddr,
     tls: bool,
     insecure: bool,
     cert: Option<String>,
@@ -762,7 +818,7 @@ fn parse_args() -> Args {
     if server.is_empty() { server = std::env::var("TUNNEL_SERVER").unwrap_or_default(); }
     if name.is_empty() { name = std::env::var("TUNNEL_NAME").unwrap_or_default(); }
     if token.is_empty() { token = std::env::var("TUNNEL_TOKEN").unwrap_or_default(); }
-    if target.is_empty() { target = std::env::var("TUNNEL_TARGET").unwrap_or_else(|_| "127.0.0.1:3000".into()); }
+    if target.is_empty() { target = std::env::var("TUNNEL_TARGET").unwrap_or_else(|_| DEFAULT_TARGET.into()); }
     if !tls && std::env::var("TUNNEL_TLS").map(|v| v == "true" || v == "1").unwrap_or(false) { tls = true; }
     if cert.is_none() { cert = std::env::var("TUNNEL_CERT").ok(); if cert.is_some() { tls = true; } }
     if key.is_none() { key = std::env::var("TUNNEL_KEY").ok(); }
@@ -773,6 +829,14 @@ fn parse_args() -> Args {
         eprintln!("Error: --server and --name required");
         std::process::exit(1);
     }
+
+    let target = match resolve_target(&target) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    };
 
     Args { server, name, token, target, tls, insecure, cert, key, health_path, health_interval, restart_cmd, timeout }
 }
@@ -817,4 +881,24 @@ mod tests {
         assert_eq!(&p[pos + 1..], b"secret");
     }
 
+    #[test]
+    fn target_hostname_resolved_not_rewritten() {
+        assert!(resolve_target("127.0.0.1:3000").is_ok());
+        assert!(resolve_target("localhost:3000").is_ok());
+    }
+
+    #[test]
+    fn target_invalid_rejected() {
+        assert!(resolve_target("localhost").is_err());
+        assert!(resolve_target("not a valid target").is_err());
+    }
+
+    #[test]
+    fn extract_host_handles_ipv6() {
+        assert_eq!(extract_host("[::1]:8443"), "::1");
+        assert_eq!(extract_host("[2001:db8::1]:443"), "2001:db8::1");
+        assert_eq!(extract_host("example.com:443"), "example.com");
+        assert_eq!(extract_host("example.com"), "example.com");
+        assert_eq!(extract_host("::1"), "::1");
+    }
 }
