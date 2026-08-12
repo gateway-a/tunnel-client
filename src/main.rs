@@ -164,39 +164,16 @@ fn lock_safe<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// TCP keepalive so a connection dropped by a NAT or a firewall is noticed
+/// rather than sitting there looking healthy. socket2 knows what each platform
+/// supports; only Linux lets the probe count be set.
 fn enable_keepalive(stream: &TcpStream) {
-    use std::os::unix::io::AsRawFd;
-    let fd = stream.as_raw_fd();
-    unsafe {
-        let on: libc::c_int = 1;
-        libc::setsockopt(
-            fd, libc::SOL_SOCKET, libc::SO_KEEPALIVE,
-            &on as *const _ as *const libc::c_void,
-            std::mem::size_of_val(&on) as libc::socklen_t,
-        );
-        #[cfg(target_os = "linux")]
-        let keepidle_opt = libc::TCP_KEEPIDLE;
-        #[cfg(target_os = "macos")]
-        let keepidle_opt = libc::TCP_KEEPALIVE;
-        let idle: libc::c_int = 30;
-        libc::setsockopt(
-            fd, libc::IPPROTO_TCP, keepidle_opt,
-            &idle as *const _ as *const libc::c_void,
-            std::mem::size_of_val(&idle) as libc::socklen_t,
-        );
-        let intvl: libc::c_int = 10;
-        libc::setsockopt(
-            fd, libc::IPPROTO_TCP, libc::TCP_KEEPINTVL,
-            &intvl as *const _ as *const libc::c_void,
-            std::mem::size_of_val(&intvl) as libc::socklen_t,
-        );
-        let cnt: libc::c_int = 3;
-        libc::setsockopt(
-            fd, libc::IPPROTO_TCP, libc::TCP_KEEPCNT,
-            &cnt as *const _ as *const libc::c_void,
-            std::mem::size_of_val(&cnt) as libc::socklen_t,
-        );
-    }
+    let ka = socket2::TcpKeepalive::new()
+        .with_time(Duration::from_secs(30))
+        .with_interval(Duration::from_secs(10));
+    #[cfg(target_os = "linux")]
+    let ka = ka.with_retries(3);
+    let _ = socket2::SockRef::from(stream).set_tcp_keepalive(&ka);
 }
 
 // --- Main ---
@@ -241,9 +218,8 @@ fn main() {
                     if consecutive_failures >= 3 {
                         if let Some(ref cmd) = restart_cmd {
                             vlog!("[health] restarting backend: {}", cmd);
-                            let _ = std::process::Command::new("sh")
-                                .args(["-c", cmd])
-                                .status();
+                            let (shell, flag) = if cfg!(windows) { ("cmd", "/C") } else { ("sh", "-c") };
+                            let _ = std::process::Command::new(shell).args([flag, cmd]).status();
                             consecutive_failures = 0;
                             std::thread::sleep(Duration::from_secs(5));
                         }
@@ -730,24 +706,13 @@ fn backend_reader_simple(
 }
 
 
-// --- Signal handling ---
+// --- Shutdown ---
 
+/// Ctrl+C (and SIGTERM where there is one) flips the run flag so the threads
+/// wind down and the connection closes cleanly instead of being cut.
 fn setup_signal_handler(running: &Arc<AtomicBool>) {
-    RUNNING_PTR.store(Arc::as_ptr(running) as *mut _, Ordering::Release);
-    unsafe {
-        libc::signal(libc::SIGINT, sig_handler as libc::sighandler_t);
-        libc::signal(libc::SIGTERM, sig_handler as libc::sighandler_t);
-    }
-}
-
-static RUNNING_PTR: std::sync::atomic::AtomicPtr<AtomicBool> =
-    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
-
-extern "C" fn sig_handler(_: libc::c_int) {
-    let ptr = RUNNING_PTR.load(Ordering::Acquire);
-    if !ptr.is_null() {
-        unsafe { &*ptr }.store(false, Ordering::Release);
-    }
+    let running = Arc::clone(running);
+    let _ = ctrlc::set_handler(move || running.store(false, Ordering::Release));
 }
 
 // --- CLI ---

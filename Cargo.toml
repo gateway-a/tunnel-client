@@ -1,6 +1,6 @@
 [package]
 name = "gateway-tunnel"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 
 [[bin]]
@@ -8,7 +8,8 @@ name = "gateway-tunnel"
 path = "src/main.rs"
 
 [dependencies]
-libc = "0.2"
+socket2 = "0.5"
+ctrlc = "3"
 chacha20poly1305 = "0.10"
 getrandom = "0.2"
 hmac = "0.12"

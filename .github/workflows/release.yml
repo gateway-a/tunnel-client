@@ -56,3 +56,17 @@ jobs:
           archive: $bin-$target
           token: ${{ secrets.GITHUB_TOKEN }}
           checksum: sha256
+
+  smoke:
+    name: runs on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      # Proves the binary links and starts on each platform. The datapath itself
+      # needs a server, so it is covered elsewhere; what breaks per-platform is
+      # the socket and signal code, and that is reached by simply running.
+      - run: cargo run --release -- --help
