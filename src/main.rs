@@ -102,6 +102,9 @@ const IDLE_READ_TIMEOUT: Duration = Duration::from_secs(30);
 const TLS_POLL_INTERVAL: Duration = Duration::from_millis(5);
 const MAX_HEADER_BYTES: usize = 16 * 1024;
 const CHUNK_END: &[u8] = b"0\r\n\r\n";
+/// How often an upgraded connection looks up from its socket to notice the
+/// tunnel has gone.
+const UPGRADE_POLL: Duration = Duration::from_secs(5);
 const DEFAULT_TARGET: &str = "127.0.0.1:3000";
 const FRAME_KEY_LABEL: &[u8] = b"tunnel-frame-encryption-key-v1";
 const WRITE_QUEUE_MAX_BYTES: usize = 16 * 1024 * 1024;
@@ -682,6 +685,7 @@ fn backend_reader_simple(
     // charged to the request.
     let mut body_target: Option<usize> = None;
     let mut is_chunked = false;
+    let mut upgraded = false;
     let mut total_read = 0usize;
     let mut header_len = 0usize;
     let mut tail = Vec::with_capacity(CHUNK_END.len());
@@ -707,7 +711,16 @@ fn backend_reader_simple(
                                 || lower.contains("content-type:text/event-stream");
                             is_chunked = lower.contains("transfer-encoding: chunked")
                                 || lower.contains("transfer-encoding:chunked");
-                            if is_sse {
+                            // 101 means the response ended and a conversation
+                            // began. Nothing about it says how long that
+                            // conversation is, so silence must stop meaning the
+                            // end of it — a websocket sits idle between
+                            // messages, and treating the first quiet moment as
+                            // the end closed the socket under the browser.
+                            upgraded = lower.starts_with("http/1.1 101");
+                            if upgraded {
+                                subsequent_timeout = UPGRADE_POLL;
+                            } else if is_sse {
                                 subsequent_timeout = Duration::from_secs(600);
                             } else if is_chunked {
                                 subsequent_timeout = Duration::from_secs(30);
@@ -744,7 +757,11 @@ fn backend_reader_simple(
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock
                 || e.kind() == std::io::ErrorKind::TimedOut => {
-                // If we already got data and timeout → response complete
+                // Silence ends an ordinary response. An upgraded connection is
+                // not a response any more, so it only ends when a side closes
+                // it or the tunnel goes away — the short poll is what keeps
+                // that check responsive.
+                if upgraded { continue; }
                 if got_data { break; }
                 continue;
             }
