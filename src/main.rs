@@ -106,13 +106,16 @@ fn build_crypto(token: &str) -> Result<Option<Arc<FrameCrypto>>, String> {
     }
 }
 
-fn resolve_target(target: &str) -> Result<std::net::SocketAddr, String> {
+fn resolve_addr(flag: &str, addr: &str) -> Result<std::net::SocketAddr, String> {
     use std::net::ToSocketAddrs;
-    target
-        .to_socket_addrs()
-        .map_err(|e| format!("invalid --target '{}': {}", target, e))?
+    addr.to_socket_addrs()
+        .map_err(|e| format!("invalid {} '{}': {}", flag, addr, e))?
         .next()
-        .ok_or_else(|| format!("--target '{}' resolved to no addresses", target))
+        .ok_or_else(|| format!("{} '{}' resolved to no addresses", flag, addr))
+}
+
+fn resolve_target(target: &str) -> Result<std::net::SocketAddr, String> {
+    resolve_addr("--target", target)
 }
 
 fn enqueue_frame(
@@ -302,7 +305,7 @@ fn check_backend_health(target: std::net::SocketAddr, path: &str) -> bool {
 
 fn run_tunnel(args: &Args, running: &AtomicBool) -> Result<(), String> {
     let tcp = TcpStream::connect_timeout(
-        &args.server.parse().map_err(|e| format!("parse: {}", e))?,
+        &resolve_addr("--server", &args.server)?,
         Duration::from_secs(10),
     ).map_err(|e| format!("connect: {}", e))?;
     tcp.set_nodelay(true).ok();
