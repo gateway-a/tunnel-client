@@ -94,6 +94,14 @@ const READ_BUF_SIZE: usize = 65536;
 const RECONNECT_BASE_MS: u64 = 1000;
 const RECONNECT_MAX_MS: u64 = 30000;
 const IDLE_READ_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long the TLS loop will sit in a read before looking at what it has to
+/// write. It cannot use a second thread — a TLS stream is not clonable — so
+/// this is what bounds the delay between a backend answering and the answer
+/// leaving. Left blocking, the loop only woke on the server's 5-second ping and
+/// every response inherited a wait of up to that long.
+const TLS_POLL_INTERVAL: Duration = Duration::from_millis(5);
+const MAX_HEADER_BYTES: usize = 16 * 1024;
+const CHUNK_END: &[u8] = b"0\r\n\r\n";
 const DEFAULT_TARGET: &str = "127.0.0.1:3000";
 const FRAME_KEY_LABEL: &[u8] = b"tunnel-frame-encryption-key-v1";
 const WRITE_QUEUE_MAX_BYTES: usize = 16 * 1024 * 1024;
@@ -303,7 +311,11 @@ fn run_tunnel(args: &Args, running: &AtomicBool) -> Result<(), String> {
         vlog!("[tunnel] connected (TLS{})! forwarding to {}",
             if has_cert { "+mTLS" } else { "" }, args.target);
 
-        // For TLS we use single-thread read+write with timeout
+        // The handshake and AUTH are request/response, so they wait as long as
+        // they need; the session that follows interleaves reads and writes on
+        // this one thread, and only a bounded read lets a queued response go
+        // out without waiting for the server to say something first.
+        tls_stream.sock.set_read_timeout(Some(TLS_POLL_INTERVAL)).ok();
         run_tunnel_tls_loop(&mut tls_stream, args, running)
     } else {
         run_tunnel_on_stream(tcp, args, running)
@@ -636,6 +648,21 @@ struct StreamState {
     backend_reader: Option<TcpStream>,
 }
 
+/// The declared body length, if the response declares one.
+fn content_length(lower_headers: &str) -> Option<usize> {
+    lower_headers
+        .lines()
+        .find_map(|l| l.strip_prefix("content-length:"))
+        .and_then(|v| v.trim().parse().ok())
+}
+
+/// Statuses that carry no body whatever the headers say, so the response is
+/// over the moment its headers are.
+fn bodiless(lower_headers: &str) -> bool {
+    let status = lower_headers.split_whitespace().nth(1).unwrap_or("");
+    matches!(status, "204" | "304")
+}
+
 fn backend_reader_simple(
     stream_id: u32,
     mut backend: TcpStream,
@@ -646,9 +673,18 @@ fn backend_reader_simple(
 ) {
     let mut buf = [0u8; 32768];
     let mut got_data = false;
-    let mut header_buf: Vec<u8> = Vec::with_capacity(2048);
+    let mut header_buf: Vec<u8> = Vec::with_capacity(MAX_HEADER_BYTES);
     let mut headers_parsed = false;
     let mut subsequent_timeout = Duration::from_millis(200);
+    // What the response itself says about where it ends. A backend that keeps
+    // the connection open — which is every backend, by default — otherwise
+    // leaves the reader waiting for a timeout it does not need, and that wait is
+    // charged to the request.
+    let mut body_target: Option<usize> = None;
+    let mut is_chunked = false;
+    let mut total_read = 0usize;
+    let mut header_len = 0usize;
+    let mut tail = Vec::with_capacity(CHUNK_END.len());
 
     backend.set_read_timeout(Some(first_read_timeout)).ok();
 
@@ -658,26 +694,30 @@ fn backend_reader_simple(
             Ok(0) => break,
             Ok(n) => {
                 got_data = true;
+                total_read += n;
                 if !headers_parsed {
-                    header_buf.extend_from_slice(&buf[..n.min(2048)]);
+                    header_buf.extend_from_slice(&buf[..n]);
                     if let Some(end) = header_buf.windows(4).position(|w| w == b"\r\n\r\n") {
                         headers_parsed = true;
+                        header_len = end + 4;
                         let head = &header_buf[..end];
                         if let Ok(s) = std::str::from_utf8(head) {
                             let lower = s.to_ascii_lowercase();
                             let is_sse = lower.contains("content-type: text/event-stream")
                                 || lower.contains("content-type:text/event-stream");
-                            let is_chunked = lower.contains("transfer-encoding: chunked")
+                            is_chunked = lower.contains("transfer-encoding: chunked")
                                 || lower.contains("transfer-encoding:chunked");
                             if is_sse {
                                 subsequent_timeout = Duration::from_secs(600);
                             } else if is_chunked {
                                 subsequent_timeout = Duration::from_secs(30);
+                            } else {
+                                body_target = content_length(&lower).or_else(|| bodiless(&lower).then_some(0));
                             }
                         }
                         header_buf.clear();
                         header_buf.shrink_to_fit();
-                    } else if header_buf.len() > 2048 {
+                    } else if header_buf.len() > MAX_HEADER_BYTES {
                         headers_parsed = true;
                     }
                 }
@@ -687,6 +727,19 @@ fn backend_reader_simple(
                     buf[..n].to_vec()
                 };
                 enqueue_frame(&write_queue, encode_frame(FRAME_DATA, stream_id, &frame_payload), &closed);
+
+                if headers_parsed {
+                    if let Some(target) = body_target {
+                        if total_read.saturating_sub(header_len) >= target { break; }
+                    } else if is_chunked {
+                        // The terminal chunk can straddle two reads, so the last
+                        // few bytes are carried over.
+                        let keep = CHUNK_END.len().saturating_sub(1);
+                        tail.extend_from_slice(&buf[n.saturating_sub(CHUNK_END.len())..n]);
+                        if tail.ends_with(CHUNK_END) { break; }
+                        if tail.len() > keep { tail.drain(..tail.len() - keep); }
+                    }
+                }
                 backend.set_read_timeout(Some(subsequent_timeout)).ok();
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock
