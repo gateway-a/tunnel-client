@@ -129,6 +129,43 @@ fn resolve_target(target: &str) -> Result<std::net::SocketAddr, String> {
     resolve_addr("--target", target)
 }
 
+/// `KEY=HOST:PORT`, the gateway's `tunnel_route` key and the local service it
+/// stands for.
+fn parse_route(spec: &str) -> Result<(String, std::net::SocketAddr), String> {
+    let (key, target) = spec
+        .split_once('=')
+        .ok_or_else(|| format!("--route '{}': expected KEY=HOST:PORT", spec))?;
+    let key = key.trim();
+    if key.is_empty() {
+        return Err(format!("--route '{}': empty key", spec));
+    }
+    Ok((key.to_string(), resolve_addr("--route", target.trim())?))
+}
+
+/// Where a stream goes. The gateway names the route in the OPEN frame; no name
+/// is the default target, as is every name when no routes were given — that is
+/// what a single-target client has always done. A name this client was not
+/// told about is refused rather than sent to some other service.
+fn route_target(args: &Args, key: &[u8]) -> Result<std::net::SocketAddr, String> {
+    let key = String::from_utf8_lossy(key);
+    if key.is_empty() || args.routes.is_empty() {
+        return Ok(args.target);
+    }
+    args.routes
+        .get(key.as_ref())
+        .copied()
+        .ok_or_else(|| format!("no local service for route '{}' — start the client with --route {}=HOST:PORT", key, key))
+}
+
+fn bad_gateway(reason: &str) -> Vec<u8> {
+    format!(
+        "HTTP/1.1 502 Bad Gateway\r\ncontent-type: text/plain; charset=utf-8\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+        reason.len(),
+        reason
+    )
+    .into_bytes()
+}
+
 fn enqueue_frame(
     queue: &(Mutex<Vec<Vec<u8>>>, std::sync::Condvar),
     frame: Vec<u8>,
@@ -311,8 +348,8 @@ fn run_tunnel(args: &Args, running: &AtomicBool) -> Result<(), String> {
         do_auth(&mut tls_stream, args)?;
 
         let has_cert = args.cert.is_some();
-        vlog!("[tunnel] connected (TLS{})! forwarding to {}",
-            if has_cert { "+mTLS" } else { "" }, args.target);
+        vlog!("[tunnel] connected (TLS{})! forwarding to {} ({} routes)",
+            if has_cert { "+mTLS" } else { "" }, args.target, args.routes.len());
 
         // The handshake and AUTH are request/response, so they wait as long as
         // they need; the session that follows interleaves reads and writes on
@@ -552,19 +589,25 @@ fn handle_frame(
     } else { payload };
     match frame_type {
         FRAME_OPEN => {
-            let (bw, br) = match TcpStream::connect_timeout(
-                &args.target,
-                Duration::from_secs(args.timeout),
-            ) {
-                Ok(s) => {
-                    s.set_nodelay(true).ok();
-                    let r = s.try_clone().ok();
-                    (Some(s), r)
+            let state = match route_target(args, payload) {
+                Ok(target) => match TcpStream::connect_timeout(&target, Duration::from_secs(args.timeout)) {
+                    Ok(s) => {
+                        s.set_nodelay(true).ok();
+                        let r = s.try_clone().ok();
+                        StreamState { backend_writer: Some(s), backend_reader: r, failure: None }
+                    }
+                    Err(e) => StreamState {
+                        backend_writer: None,
+                        backend_reader: None,
+                        failure: Some(format!("local service {} is not answering: {}", target, e)),
+                    },
+                },
+                Err(reason) => {
+                    vlog!("[client] {}", reason);
+                    StreamState { backend_writer: None, backend_reader: None, failure: Some(reason) }
                 }
-                Err(_) => (None, None),
             };
-            let mut s = lock_safe(streams_map);
-            s.insert(stream_id, StreamState { backend_writer: bw, backend_reader: br });
+            lock_safe(streams_map).insert(stream_id, state);
         }
         FRAME_DATA => {
             let start_reader = {
@@ -591,11 +634,16 @@ fn handle_frame(
                 let s = lock_safe(streams_map);
                 if let Some(state) = s.get(&stream_id) {
                     if state.backend_writer.is_none() {
-                        let resp = b"HTTP/1.1 502 Bad Gateway\r\ncontent-length: 0\r\n\r\n";
+                        let resp = bad_gateway(state.failure.as_deref().unwrap_or("local service unavailable"));
+                        let resp = match crypto {
+                            Some(c) => c.encrypt(&resp),
+                            None => resp,
+                        };
                         if let Ok(mut q) = write_queue.0.lock() {
-                            q.push(encode_frame(FRAME_DATA, stream_id, resp));
+                            q.push(encode_frame(FRAME_DATA, stream_id, &resp));
                             q.push(encode_frame(FRAME_CLOSE, stream_id, &[]));
                         }
+                        write_queue.1.notify_one();
                     }
                 }
             }
@@ -649,6 +697,7 @@ fn tunnel_writer_condvar<W: Write>(mut writer: W, queue: Arc<(Mutex<Vec<Vec<u8>>
 struct StreamState {
     backend_writer: Option<TcpStream>,
     backend_reader: Option<TcpStream>,
+    failure: Option<String>,
 }
 
 /// The declared body length, if the response declares one.
@@ -792,6 +841,7 @@ struct Args {
     name: String,
     token: String,
     target: std::net::SocketAddr,
+    routes: HashMap<String, std::net::SocketAddr>,
     tls: bool,
     insecure: bool,
     cert: Option<String>,
@@ -808,6 +858,7 @@ fn parse_args() -> Args {
     let mut name = String::new();
     let mut token = String::new();
     let mut target = String::new();
+    let mut route_specs: Vec<String> = Vec::new();
     let mut tls = false;
     let mut insecure = false;
     let mut cert: Option<String> = None;
@@ -824,6 +875,7 @@ fn parse_args() -> Args {
             "--name" | "-n" => { i += 1; if i < args.len() { name = args[i].clone(); } }
             "--token" | "-t" => { i += 1; if i < args.len() { token = args[i].clone(); } }
             "--target" | "-T" => { i += 1; if i < args.len() { target = args[i].clone(); } }
+            "--route" | "-r" => { i += 1; if i < args.len() { route_specs.push(args[i].clone()); } }
             "--cert" => { i += 1; if i < args.len() { cert = Some(args[i].clone()); tls = true; } }
             "--key" => { i += 1; if i < args.len() { key = Some(args[i].clone()); } }
             "--tls" => { tls = true; }
@@ -838,6 +890,7 @@ fn parse_args() -> Args {
                 eprintln!("  -n, --name   NAME        Tunnel name");
                 eprintln!("  -t, --token  TOKEN       Auth token");
                 eprintln!("  -T, --target HOST:PORT   Local service (default: 127.0.0.1:3000)");
+                eprintln!("  -r, --route KEY=HOST:PORT  Local service for the gateway's tunnel_route KEY (repeatable)");
                 eprintln!("  --tls                    Enable TLS");
                 eprintln!("  --cert FILE              Client certificate (enables mTLS)");
                 eprintln!("  --key FILE               Client private key");
@@ -857,6 +910,11 @@ fn parse_args() -> Args {
     if name.is_empty() { name = std::env::var("TUNNEL_NAME").unwrap_or_default(); }
     if token.is_empty() { token = std::env::var("TUNNEL_TOKEN").unwrap_or_default(); }
     if target.is_empty() { target = std::env::var("TUNNEL_TARGET").unwrap_or_else(|_| DEFAULT_TARGET.into()); }
+    if route_specs.is_empty() {
+        if let Ok(v) = std::env::var("TUNNEL_ROUTES") {
+            route_specs = v.split(',').map(str::trim).filter(|r| !r.is_empty()).map(String::from).collect();
+        }
+    }
     if !tls && std::env::var("TUNNEL_TLS").map(|v| v == "true" || v == "1").unwrap_or(false) { tls = true; }
     if cert.is_none() { cert = std::env::var("TUNNEL_CERT").ok(); if cert.is_some() { tls = true; } }
     if key.is_none() { key = std::env::var("TUNNEL_KEY").ok(); }
@@ -876,7 +934,15 @@ fn parse_args() -> Args {
         }
     };
 
-    Args { server, name, token, target, tls, insecure, cert, key, health_path, health_interval, restart_cmd, timeout }
+    let routes = match route_specs.iter().map(|r| parse_route(r)).collect::<Result<HashMap<_, _>, _>>() {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    Args { server, name, token, target, routes, tls, insecure, cert, key, health_path, health_interval, restart_cmd, timeout }
 }
 
 #[cfg(test)]
@@ -938,5 +1004,66 @@ mod tests {
         assert_eq!(extract_host("example.com:443"), "example.com");
         assert_eq!(extract_host("example.com"), "example.com");
         assert_eq!(extract_host("::1"), "::1");
+    }
+
+    fn args_with(routes: &[&str]) -> Args {
+        Args {
+            server: "x:1".into(),
+            name: "n".into(),
+            token: String::new(),
+            target: resolve_target("127.0.0.1:3000").unwrap(),
+            routes: routes.iter().map(|r| parse_route(r).unwrap()).collect(),
+            tls: false,
+            insecure: false,
+            cert: None,
+            key: None,
+            health_path: None,
+            health_interval: 30,
+            restart_cmd: None,
+            timeout: 1,
+        }
+    }
+
+    #[test]
+    fn a_route_spec_names_a_key_and_a_target() {
+        let (k, t) = parse_route("api=127.0.0.1:8030").unwrap();
+        assert_eq!((k.as_str(), t.port()), ("api", 8030));
+        assert!(parse_route("api").is_err());
+        assert!(parse_route("=127.0.0.1:1").is_err());
+        assert!(parse_route("api=nowhere").is_err());
+    }
+
+    #[test]
+    fn each_route_key_reaches_its_own_port() {
+        let a = args_with(&["web=127.0.0.1:3000", "api=127.0.0.1:8030"]);
+        assert_eq!(route_target(&a, b"api").unwrap().port(), 8030);
+        assert_eq!(route_target(&a, b"web").unwrap().port(), 3000);
+    }
+
+    #[test]
+    fn no_key_is_the_default_target() {
+        let a = args_with(&["api=127.0.0.1:8030"]);
+        assert_eq!(route_target(&a, b"").unwrap().port(), 3000);
+    }
+
+    #[test]
+    fn a_single_target_client_serves_every_key() {
+        let a = args_with(&[]);
+        assert_eq!(route_target(&a, b"api").unwrap().port(), 3000);
+    }
+
+    #[test]
+    fn an_unknown_key_is_refused_not_misrouted() {
+        let a = args_with(&["api=127.0.0.1:8030"]);
+        let err = route_target(&a, b"admin").unwrap_err();
+        assert!(err.contains("--route admin="), "{err}");
+    }
+
+    #[test]
+    fn a_refusal_is_a_complete_response() {
+        let r = String::from_utf8(bad_gateway("why")).unwrap();
+        assert!(r.starts_with("HTTP/1.1 502"));
+        assert!(r.contains("content-length: 3\r\n"));
+        assert!(r.ends_with("\r\n\r\nwhy"));
     }
 }
