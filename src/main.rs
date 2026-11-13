@@ -93,6 +93,12 @@ const FRAME_HEADER_LEN: usize = 9;
 const READ_BUF_SIZE: usize = 65536;
 const RECONNECT_BASE_MS: u64 = 1000;
 const RECONNECT_MAX_MS: u64 = 30000;
+/// A tunnel that was just created (or recreated under the same name) is live
+/// on the gateway only after its next config reload, a few seconds later; an
+/// auth reject in that window is expected and retried at once rather than
+/// backed off.
+const FRESH_AUTH_WINDOW: Duration = Duration::from_secs(15);
+const FRESH_AUTH_RETRY_MS: u64 = 1000;
 const IDLE_READ_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long the TLS loop will sit in a read before looking at what it has to
 /// write. It cannot use a second thread — a TLS stream is not clonable — so
@@ -129,9 +135,20 @@ fn resolve_target(target: &str) -> Result<std::net::SocketAddr, String> {
     resolve_addr("--target", target)
 }
 
-/// `KEY=HOST:PORT`, the gateway's `tunnel_route` key and the local service it
-/// stands for.
-fn parse_route(spec: &str) -> Result<(String, std::net::SocketAddr), String> {
+/// A local service a route key stands for. `raw` routes carry whole
+/// connections (the gateway's `tunnel_h2` hosts) — h2c/gRPC bytes piped both
+/// ways with no HTTP read in between.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Local {
+    addr: std::net::SocketAddr,
+    raw: bool,
+}
+
+const RAW_SCHEMES: [&str; 3] = ["h2c://", "grpc://", "tcp://"];
+
+/// `KEY=HOST:PORT`, or `KEY=h2c://HOST:PORT` (also grpc://, tcp://) for a
+/// route whose connections are relayed whole.
+fn parse_route(spec: &str) -> Result<(String, Local), String> {
     let (key, target) = spec
         .split_once('=')
         .ok_or_else(|| format!("--route '{}': expected KEY=HOST:PORT", spec))?;
@@ -139,17 +156,22 @@ fn parse_route(spec: &str) -> Result<(String, std::net::SocketAddr), String> {
     if key.is_empty() {
         return Err(format!("--route '{}': empty key", spec));
     }
-    Ok((key.to_string(), resolve_addr("--route", target.trim())?))
+    let target = target.trim();
+    let (raw, target) = match RAW_SCHEMES.iter().find_map(|p| target.strip_prefix(p)) {
+        Some(rest) => (true, rest),
+        None => (false, target.strip_prefix("http://").unwrap_or(target)),
+    };
+    Ok((key.to_string(), Local { addr: resolve_addr("--route", target)?, raw }))
 }
 
 /// Where a stream goes. The gateway names the route in the OPEN frame; no name
 /// is the default target, as is every name when no routes were given — that is
 /// what a single-target client has always done. A name this client was not
 /// told about is refused rather than sent to some other service.
-fn route_target(args: &Args, key: &[u8]) -> Result<std::net::SocketAddr, String> {
+fn route_target(args: &Args, key: &[u8]) -> Result<Local, String> {
     let key = String::from_utf8_lossy(key);
     if key.is_empty() || args.routes.is_empty() {
-        return Ok(args.target);
+        return Ok(Local { addr: args.target, raw: false });
     }
     args.routes
         .get(key.as_ref())
@@ -278,6 +300,7 @@ fn main() {
     }
 
     let mut backoff = RECONNECT_BASE_MS;
+    let started = std::time::Instant::now();
 
     while running.load(Ordering::Relaxed) {
         vlog!("[tunnel] connecting to {} as '{}'...", args.server, args.name);
@@ -293,7 +316,7 @@ fn main() {
             }
             Ok(Err(e)) => {
                 eprintln!("[tunnel] error: {}", e);
-                backoff = (backoff * 2).min(RECONNECT_MAX_MS);
+                backoff = next_backoff(backoff, &e, started.elapsed());
             }
             Err(_) => {
                 eprintln!("[tunnel] panic recovered — reconnecting");
@@ -306,6 +329,13 @@ fn main() {
             std::thread::sleep(Duration::from_millis(backoff));
         }
     }
+}
+
+fn next_backoff(current: u64, error: &str, since_start: Duration) -> u64 {
+    if error.starts_with("auth rejected") && since_start < FRESH_AUTH_WINDOW {
+        return FRESH_AUTH_RETRY_MS;
+    }
+    (current * 2).min(RECONNECT_MAX_MS)
 }
 
 fn check_backend_health(target: std::net::SocketAddr, path: &str) -> bool {
@@ -590,24 +620,36 @@ fn handle_frame(
     match frame_type {
         FRAME_OPEN => {
             let state = match route_target(args, payload) {
-                Ok(target) => match TcpStream::connect_timeout(&target, Duration::from_secs(args.timeout)) {
+                Ok(local) => match TcpStream::connect_timeout(&local.addr, Duration::from_secs(args.timeout)) {
                     Ok(s) => {
                         s.set_nodelay(true).ok();
                         let r = s.try_clone().ok();
-                        StreamState { backend_writer: Some(s), backend_reader: r, failure: None }
+                        StreamState { backend_writer: Some(s), backend_reader: r, failure: None, raw: local.raw }
                     }
                     Err(e) => StreamState {
                         backend_writer: None,
                         backend_reader: None,
-                        failure: Some(format!("local service {} is not answering: {}", target, e)),
+                        failure: Some(format!("local service {} is not answering: {}", local.addr, e)),
+                        raw: local.raw,
                     },
                 },
                 Err(reason) => {
                     vlog!("[client] {}", reason);
-                    StreamState { backend_writer: None, backend_reader: None, failure: Some(reason) }
+                    StreamState { backend_writer: None, backend_reader: None, failure: Some(reason), raw: false }
                 }
             };
+            let mut state = state;
+            // A whole-connection route may be one whose server speaks first, so
+            // its reader starts now rather than on the first byte from the client.
+            let early = if state.raw { state.backend_reader.take() } else { None };
+            let failed_raw = state.raw && state.backend_writer.is_none();
             lock_safe(streams_map).insert(stream_id, state);
+            if let Some(reader_stream) = early {
+                spawn_backend_reader(stream_id, reader_stream, args, write_queue, closed, crypto, true);
+            }
+            if failed_raw {
+                queue_close(write_queue, stream_id);
+            }
         }
         FRAME_DATA => {
             let start_reader = {
@@ -617,23 +659,15 @@ fn handle_frame(
                         let _ = bw.write_all(payload);
                     }
                     // Take reader fd to spawn thread (only once)
-                    state.backend_reader.take()
+                    state.backend_reader.take().map(|r| (r, state.raw))
                 } else { None }
             };
-            if let Some(reader_stream) = start_reader {
-                let wq = Arc::clone(write_queue);
-                let cl = Arc::clone(closed);
-                let cr = crypto.clone();
-                let read_timeout = Duration::from_secs(args.timeout);
-                std::thread::spawn(move || {
-                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        backend_reader_simple(stream_id, reader_stream, wq, cl, cr, read_timeout);
-                    }));
-                });
+            if let Some((reader_stream, raw)) = start_reader {
+                spawn_backend_reader(stream_id, reader_stream, args, write_queue, closed, crypto, raw);
             } else {
                 let s = lock_safe(streams_map);
                 if let Some(state) = s.get(&stream_id) {
-                    if state.backend_writer.is_none() {
+                    if state.backend_writer.is_none() && !state.raw {
                         let resp = bad_gateway(state.failure.as_deref().unwrap_or("local service unavailable"));
                         let resp = match crypto {
                             Some(c) => c.encrypt(&resp),
@@ -664,6 +698,33 @@ fn handle_frame(
         }
         _ => {}
     }
+}
+
+fn spawn_backend_reader(
+    stream_id: u32,
+    reader_stream: TcpStream,
+    args: &Args,
+    write_queue: &Arc<(Mutex<Vec<Vec<u8>>>, std::sync::Condvar)>,
+    closed: &Arc<AtomicBool>,
+    crypto: &Option<Arc<FrameCrypto>>,
+    raw: bool,
+) {
+    let wq = Arc::clone(write_queue);
+    let cl = Arc::clone(closed);
+    let cr = crypto.clone();
+    let read_timeout = Duration::from_secs(args.timeout);
+    std::thread::spawn(move || {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            backend_reader_simple(stream_id, reader_stream, wq, cl, cr, read_timeout, raw);
+        }));
+    });
+}
+
+fn queue_close(write_queue: &Arc<(Mutex<Vec<Vec<u8>>>, std::sync::Condvar)>, stream_id: u32) {
+    if let Ok(mut q) = write_queue.0.lock() {
+        q.push(encode_frame(FRAME_CLOSE, stream_id, &[]));
+    }
+    write_queue.1.notify_one();
 }
 
 fn tunnel_writer_condvar<W: Write>(mut writer: W, queue: Arc<(Mutex<Vec<Vec<u8>>>, std::sync::Condvar)>, closed: Arc<AtomicBool>) {
@@ -698,6 +759,7 @@ struct StreamState {
     backend_writer: Option<TcpStream>,
     backend_reader: Option<TcpStream>,
     failure: Option<String>,
+    raw: bool,
 }
 
 /// The declared body length, if the response declares one.
@@ -722,24 +784,25 @@ fn backend_reader_simple(
     closed: Arc<AtomicBool>,
     crypto: Option<Arc<FrameCrypto>>,
     first_read_timeout: Duration,
+    raw: bool,
 ) {
     let mut buf = [0u8; 32768];
     let mut got_data = false;
     let mut header_buf: Vec<u8> = Vec::with_capacity(MAX_HEADER_BYTES);
-    let mut headers_parsed = false;
-    let mut subsequent_timeout = Duration::from_millis(200);
+    let mut headers_parsed = raw;
+    let mut subsequent_timeout = if raw { UPGRADE_POLL } else { Duration::from_millis(200) };
     // What the response itself says about where it ends. A backend that keeps
     // the connection open — which is every backend, by default — otherwise
     // leaves the reader waiting for a timeout it does not need, and that wait is
     // charged to the request.
     let mut body_target: Option<usize> = None;
     let mut is_chunked = false;
-    let mut upgraded = false;
+    let mut upgraded = raw;
     let mut total_read = 0usize;
     let mut header_len = 0usize;
     let mut tail = Vec::with_capacity(CHUNK_END.len());
 
-    backend.set_read_timeout(Some(first_read_timeout)).ok();
+    backend.set_read_timeout(Some(if raw { UPGRADE_POLL } else { first_read_timeout })).ok();
 
     loop {
         if closed.load(Ordering::Relaxed) { break; }
@@ -841,7 +904,7 @@ struct Args {
     name: String,
     token: String,
     target: std::net::SocketAddr,
-    routes: HashMap<String, std::net::SocketAddr>,
+    routes: HashMap<String, Local>,
     tls: bool,
     insecure: bool,
     cert: Option<String>,
@@ -890,7 +953,8 @@ fn parse_args() -> Args {
                 eprintln!("  -n, --name   NAME        Tunnel name");
                 eprintln!("  -t, --token  TOKEN       Auth token");
                 eprintln!("  -T, --target HOST:PORT   Local service (default: 127.0.0.1:3000)");
-                eprintln!("  -r, --route KEY=HOST:PORT  Local service for the gateway's tunnel_route KEY (repeatable)");
+                eprintln!("  -r, --route KEY=HOST:PORT  Local service for the gateway's tunnel_route KEY (repeatable);");
+                eprintln!("                           KEY=h2c://HOST:PORT relays whole connections (gRPC, tunnel_h2 hosts)");
                 eprintln!("  --tls                    Enable TLS");
                 eprintln!("  --cert FILE              Client certificate (enables mTLS)");
                 eprintln!("  --key FILE               Client private key");
@@ -1027,7 +1091,12 @@ mod tests {
     #[test]
     fn a_route_spec_names_a_key_and_a_target() {
         let (k, t) = parse_route("api=127.0.0.1:8030").unwrap();
-        assert_eq!((k.as_str(), t.port()), ("api", 8030));
+        assert_eq!((k.as_str(), t.addr.port(), t.raw), ("api", 8030, false));
+        for spec in ["g=h2c://127.0.0.1:6334", "g=grpc://127.0.0.1:6334", "g=tcp://127.0.0.1:6334"] {
+            let (_, t) = parse_route(spec).unwrap();
+            assert_eq!((t.addr.port(), t.raw), (6334, true), "{spec}");
+        }
+        assert!(!parse_route("w=http://127.0.0.1:80").unwrap().1.raw);
         assert!(parse_route("api").is_err());
         assert!(parse_route("=127.0.0.1:1").is_err());
         assert!(parse_route("api=nowhere").is_err());
@@ -1036,20 +1105,20 @@ mod tests {
     #[test]
     fn each_route_key_reaches_its_own_port() {
         let a = args_with(&["web=127.0.0.1:3000", "api=127.0.0.1:8030"]);
-        assert_eq!(route_target(&a, b"api").unwrap().port(), 8030);
-        assert_eq!(route_target(&a, b"web").unwrap().port(), 3000);
+        assert_eq!(route_target(&a, b"api").unwrap().addr.port(), 8030);
+        assert_eq!(route_target(&a, b"web").unwrap().addr.port(), 3000);
     }
 
     #[test]
     fn no_key_is_the_default_target() {
         let a = args_with(&["api=127.0.0.1:8030"]);
-        assert_eq!(route_target(&a, b"").unwrap().port(), 3000);
+        assert_eq!(route_target(&a, b"").unwrap().addr.port(), 3000);
     }
 
     #[test]
     fn a_single_target_client_serves_every_key() {
         let a = args_with(&[]);
-        assert_eq!(route_target(&a, b"api").unwrap().port(), 3000);
+        assert_eq!(route_target(&a, b"api").unwrap().addr.port(), 3000);
     }
 
     #[test]
@@ -1065,5 +1134,57 @@ mod tests {
         assert!(r.starts_with("HTTP/1.1 502"));
         assert!(r.contains("content-length: 3\r\n"));
         assert!(r.ends_with("\r\n\r\nwhy"));
+    }
+
+    fn queued_frames(q: &Arc<(Mutex<Vec<Vec<u8>>>, std::sync::Condvar)>) -> Vec<(u8, Vec<u8>)> {
+        lock_safe(&q.0).iter().filter_map(|f| decode_frame(f).map(|(t, _, _, p)| (t, p.to_vec()))).collect()
+    }
+
+    #[test]
+    fn a_raw_route_pipes_bytes_both_ways_without_reading_http() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let (mut c, _) = listener.accept().unwrap();
+            c.write_all(b"PRI-greeting").unwrap();
+            let mut buf = [0u8; 64];
+            let n = c.read(&mut buf).unwrap();
+            c.write_all(&buf[..n]).unwrap();
+            std::thread::sleep(Duration::from_millis(300));
+        });
+        let args = args_with(&[&format!("g=h2c://127.0.0.1:{port}")]);
+        let streams: Arc<Mutex<HashMap<u32, StreamState>>> = Arc::new(Mutex::new(HashMap::new()));
+        let q: Arc<(Mutex<Vec<Vec<u8>>>, std::sync::Condvar)> = Arc::new((Mutex::new(Vec::new()), std::sync::Condvar::new()));
+        let closed = Arc::new(AtomicBool::new(false));
+        handle_frame(FRAME_OPEN, 1, b"g", &args, &streams, &q, &closed, &None);
+        std::thread::sleep(Duration::from_millis(150));
+        assert!(queued_frames(&q).iter().any(|(t, p)| *t == FRAME_DATA && p == b"PRI-greeting"), "server-first bytes not relayed");
+        handle_frame(FRAME_DATA, 1, b"\x00\x01binary-not-http", &args, &streams, &q, &closed, &None);
+        std::thread::sleep(Duration::from_millis(150));
+        let frames = queued_frames(&q);
+        assert!(frames.iter().any(|(t, p)| *t == FRAME_DATA && p == b"\x00\x01binary-not-http"), "{frames:?}");
+        assert!(!frames.iter().any(|(t, p)| *t == FRAME_DATA && p.starts_with(b"HTTP/1.1 502")));
+        closed.store(true, Ordering::Release);
+    }
+
+    #[test]
+    fn an_unreachable_raw_route_closes_instead_of_answering_http() {
+        let args = args_with(&["g=h2c://127.0.0.1:1"]);
+        let streams: Arc<Mutex<HashMap<u32, StreamState>>> = Arc::new(Mutex::new(HashMap::new()));
+        let q: Arc<(Mutex<Vec<Vec<u8>>>, std::sync::Condvar)> = Arc::new((Mutex::new(Vec::new()), std::sync::Condvar::new()));
+        let closed = Arc::new(AtomicBool::new(false));
+        handle_frame(FRAME_OPEN, 7, b"g", &args, &streams, &q, &closed, &None);
+        let frames = queued_frames(&q);
+        assert!(frames.iter().any(|(t, _)| *t == FRAME_CLOSE));
+        assert!(!frames.iter().any(|(t, _)| *t == FRAME_DATA));
+    }
+
+    #[test]
+    fn an_early_auth_reject_is_retried_at_once_later_ones_back_off() {
+        let early = next_backoff(4000, "auth rejected: unauthorized", Duration::from_secs(3));
+        assert_eq!(early, FRESH_AUTH_RETRY_MS);
+        assert_eq!(next_backoff(4000, "auth rejected: unauthorized", Duration::from_secs(60)), 8000);
+        assert_eq!(next_backoff(4000, "connect: refused", Duration::from_secs(1)), 8000);
+        assert_eq!(next_backoff(RECONNECT_MAX_MS, "connect: refused", Duration::from_secs(1)), RECONNECT_MAX_MS);
     }
 }
