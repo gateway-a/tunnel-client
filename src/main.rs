@@ -88,6 +88,8 @@ const FRAME_DATA: u8 = 0x05;
 const FRAME_CLOSE: u8 = 0x06;
 const FRAME_PING: u8 = 0x07;
 const FRAME_PONG: u8 = 0x08;
+/// Sent once right after AUTH_OK: who this agent is, for the gateway's session log.
+const FRAME_INFO: u8 = 0x09;
 
 const FRAME_HEADER_LEN: usize = 9;
 const READ_BUF_SIZE: usize = 65536;
@@ -114,6 +116,7 @@ const UPGRADE_POLL: Duration = Duration::from_secs(5);
 const DEFAULT_TARGET: &str = "127.0.0.1:3000";
 const FRAME_KEY_LABEL: &[u8] = b"tunnel-frame-encryption-key-v1";
 const WRITE_QUEUE_MAX_BYTES: usize = 16 * 1024 * 1024;
+const MAX_DEVICE_ID_CHARS: usize = 128;
 
 fn build_crypto(token: &str) -> Result<Option<Arc<FrameCrypto>>, String> {
     if token.is_empty() {
@@ -461,12 +464,81 @@ fn do_auth<S: Read + Write>(stream: &mut S, args: &Args) -> Result<(), String> {
     if n == 0 { return Err("connection closed during auth".into()); }
 
     match decode_frame(&resp_buf[..n]) {
-        Some((FRAME_AUTH_OK, _, _, _)) => Ok(()),
+        Some((FRAME_AUTH_OK, _, _, _)) => stream
+            .write_all(&info_frame(args)?)
+            .map_err(|e| format!("info write: {}", e)),
         Some((FRAME_AUTH_ERR, _, _, payload)) => {
             Err(format!("auth rejected: {}", String::from_utf8_lossy(payload)))
         }
         _ => Err("unexpected auth response".into()),
     }
+}
+
+fn info_payload(device_id: &str) -> Vec<u8> {
+    serde_json::json!({
+        "os": std::env::consts::OS,
+        "arch": std::env::consts::ARCH,
+        "hostname": gethostname::gethostname().to_string_lossy(),
+        "version": env!("CARGO_PKG_VERSION"),
+        "device_id": device_id,
+    })
+    .to_string()
+    .into_bytes()
+}
+
+/// INFO travels encrypted exactly like a DATA payload whenever a token is set.
+fn info_frame(args: &Args) -> Result<Vec<u8>, String> {
+    let payload = info_payload(&args.device_id);
+    let body = match build_crypto(&args.token)? {
+        Some(crypto) => crypto.encrypt(&payload),
+        None => payload,
+    };
+    Ok(encode_frame(FRAME_INFO, 0, &body))
+}
+
+fn device_id_path() -> Option<std::path::PathBuf> {
+    let base = if cfg!(windows) {
+        std::env::var_os("APPDATA").filter(|v| !v.is_empty()).map(std::path::PathBuf::from)
+    } else {
+        std::env::var_os("XDG_CONFIG_HOME")
+            .filter(|v| !v.is_empty())
+            .map(std::path::PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config")))
+    };
+    base.map(|b| b.join("gateway-tunnel").join("device-id"))
+}
+
+fn valid_device_id(id: &str) -> bool {
+    !id.is_empty() && id.chars().count() <= MAX_DEVICE_ID_CHARS && !id.chars().any(char::is_control)
+}
+
+/// This machine's stable id: read from `path`, or minted and saved there on
+/// first use. A machine where it cannot be saved still gets an id per run.
+fn persistent_device_id(path: Option<&std::path::Path>) -> String {
+    if let Some(existing) = path
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| valid_device_id(s))
+    {
+        return existing;
+    }
+    let id = new_uuid();
+    if let Some(p) = path {
+        if let Some(dir) = p.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let _ = std::fs::write(p, &id);
+    }
+    id
+}
+
+fn new_uuid() -> String {
+    let mut b = [0u8; 16];
+    getrandom::getrandom(&mut b).expect("csprng");
+    b[6] = (b[6] & 0x0f) | 0x40;
+    b[8] = (b[8] & 0x3f) | 0x80;
+    let hex: String = b.iter().map(|x| format!("{x:02x}")).collect();
+    format!("{}-{}-{}-{}-{}", &hex[..8], &hex[8..12], &hex[12..16], &hex[16..20], &hex[20..])
 }
 
 fn run_tunnel_tls_loop<S: Read + Write>(
@@ -913,6 +985,7 @@ struct Args {
     health_interval: u64,
     restart_cmd: Option<String>,
     timeout: u64,
+    device_id: String,
 }
 
 fn parse_args() -> Args {
@@ -930,6 +1003,7 @@ fn parse_args() -> Args {
     let mut health_interval: u64 = 30;
     let mut restart_cmd: Option<String> = None;
     let mut timeout: u64 = 30;
+    let mut device_id = String::new();
 
     let mut i = 1;
     while i < args.len() {
@@ -947,6 +1021,7 @@ fn parse_args() -> Args {
             "--health-interval" => { i += 1; if i < args.len() { health_interval = args[i].parse().unwrap_or(30); } }
             "--restart-cmd" => { i += 1; if i < args.len() { restart_cmd = Some(args[i].clone()); } }
             "--timeout" => { i += 1; if i < args.len() { timeout = args[i].parse().unwrap_or(30); } }
+            "--device-id" => { i += 1; if i < args.len() { device_id = args[i].clone(); } }
             "--help" | "-h" => {
                 eprintln!("Usage: gateway-tunnel [OPTIONS]");
                 eprintln!("  -s, --server HOST:PORT   Tunnel server address");
@@ -963,6 +1038,7 @@ fn parse_args() -> Args {
                 eprintln!("  --health-interval SECS   Health check interval (default: 30)");
                 eprintln!("  --restart-cmd CMD        Restart backend on health failure");
                 eprintln!("  --timeout SECS           Request timeout (default: 30)");
+                eprintln!("  --device-id ID           Name this machine in the gateway's session log (default: saved random id)");
                 std::process::exit(0);
             }
             _ => { if server.is_empty() { server = args[i].clone(); } }
@@ -984,6 +1060,9 @@ fn parse_args() -> Args {
     if key.is_none() { key = std::env::var("TUNNEL_KEY").ok(); }
     if health_path.is_none() { health_path = std::env::var("TUNNEL_HEALTH").ok(); }
     if restart_cmd.is_none() { restart_cmd = std::env::var("TUNNEL_RESTART_CMD").ok(); }
+    if device_id.is_empty() { device_id = std::env::var("GATEWAY_TUNNEL_DEVICE_ID").unwrap_or_default(); }
+    let device_id = device_id.trim().to_string();
+    let device_id = if valid_device_id(&device_id) { device_id } else { persistent_device_id(device_id_path().as_deref()) };
 
     if server.is_empty() || name.is_empty() {
         eprintln!("Error: --server and --name required");
@@ -1006,7 +1085,7 @@ fn parse_args() -> Args {
         }
     };
 
-    Args { server, name, token, target, routes, tls, insecure, cert, key, health_path, health_interval, restart_cmd, timeout }
+    Args { server, name, token, target, routes, tls, insecure, cert, key, health_path, health_interval, restart_cmd, timeout, device_id }
 }
 
 #[cfg(test)]
@@ -1085,7 +1164,54 @@ mod tests {
             health_interval: 30,
             restart_cmd: None,
             timeout: 1,
+            device_id: "dev-1".into(),
         }
+    }
+
+    #[test]
+    fn info_describes_this_agent() {
+        let v: serde_json::Value = serde_json::from_slice(&info_payload("dev-1")).unwrap();
+        assert_eq!(v["os"], std::env::consts::OS);
+        assert_eq!(v["arch"], std::env::consts::ARCH);
+        assert_eq!(v["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(v["device_id"], "dev-1");
+        assert!(v["hostname"].is_string());
+        assert_eq!(v.as_object().unwrap().len(), 5);
+    }
+
+    #[test]
+    fn info_frame_is_encrypted_with_the_token_and_plain_without() {
+        let mut args = args_with(&[]);
+        let (ft, sid, _, plain) = decode_frame(&info_frame(&args).unwrap()).map(|(a, b, c, d)| (a, b, c, d.to_vec())).unwrap();
+        assert_eq!((ft, sid), (FRAME_INFO, 0));
+        assert_eq!(plain, info_payload("dev-1"));
+        args.token = "tok".into();
+        let frame = info_frame(&args).unwrap();
+        let (_, _, _, sealed) = decode_frame(&frame).unwrap();
+        assert_ne!(sealed, plain.as_slice());
+        let opened = FrameCrypto::from_token("tok").unwrap().decrypt(sealed).unwrap();
+        assert_eq!(opened, info_payload("dev-1"));
+    }
+
+    #[test]
+    fn a_device_id_is_minted_once_and_then_reused() {
+        let dir = std::env::temp_dir().join(format!("gt-dev-{}", new_uuid()));
+        let path = dir.join("gateway-tunnel").join("device-id");
+        let first = persistent_device_id(Some(&path));
+        assert_eq!(first.len(), 36);
+        assert_eq!(&first[14..15], "4");
+        assert_eq!(persistent_device_id(Some(&path)), first);
+        std::fs::write(&path, "\n").unwrap();
+        assert_ne!(persistent_device_id(Some(&path)), first);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_unwritable_place_still_yields_an_id() {
+        assert_eq!(persistent_device_id(None).len(), 36);
+        assert!(!valid_device_id(""));
+        assert!(!valid_device_id("a\nb"));
+        assert!(!valid_device_id(&"x".repeat(MAX_DEVICE_ID_CHARS + 1)));
     }
 
     #[test]
